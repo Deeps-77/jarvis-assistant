@@ -1,0 +1,16 @@
+[project]
+name = "telegram-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ddgs>=9.15.0",
+    "langchain-core>=1.6.0",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.11",
+    "markdown-it-py>=4.2.0",
+    "python-telegram-bot>=22.8",
+    "sqlite-vec>=0.1.9",
+    "tzdata>=2026.3",
+]
