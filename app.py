@@ -9,7 +9,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 _secret_file = Path(__file__).parent / ".chainlit.secret"
 if not _secret_file.exists():
     _secret_file.write_text(secrets.token_hex(32), encoding="utf-8")
-os.environ["CHAINLIT_AUTH_SECRET"] = _secret_file.read_text(encoding="utf-8").strip()
+os.environ.setdefault(
+    "CHAINLIT_AUTH_SECRET", _secret_file.read_text(encoding="utf-8").strip()
+)
 
 import chainlit as cl
 
