@@ -27,6 +27,7 @@ class MemoryStore:
             self._conn.enable_load_extension(True)
             sqlite_vec.load(self._conn)
             self._conn.enable_load_extension(False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS memory USING vec0("
                 f"embedding float[{dim}] distance_metric=cosine, "

@@ -523,7 +523,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_name = f"{user_id}_{fname}"
         (DOCUMENTS_DIR / safe_name).write_bytes(raw)
 
-        result = await core.doc_store.ingest(str(user_id), fname, raw)
+        result = await core.ingest_document(str(user_id), fname, raw)
         status = result.get("status")
         if status == "added":
             await update.effective_message.reply_text(

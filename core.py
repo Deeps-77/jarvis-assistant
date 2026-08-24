@@ -95,6 +95,12 @@ def init_docs(db_path: Path):
         logger.warning("Document store init failed (%s); document tools disabled", e)
 
 
+async def ingest_document(owner: str, filename: str, raw: bytes) -> dict:
+    if not doc_store or not doc_store.enabled:
+        return {"status": "error", "message": "document storage is unavailable right now"}
+    return await doc_store.ingest(owner, filename, raw)
+
+
 def save_histories():
     try:
         data = {str(cid): messages_to_dict(msgs) for cid, msgs in chat_histories.items()}

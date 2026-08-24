@@ -17,3 +17,7 @@ chat_history.json*
 memory.db*
 logs/
 documents/
+.chainlit/
+.files/
+.chainlit.secret
+

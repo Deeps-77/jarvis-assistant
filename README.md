@@ -94,6 +94,17 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 
 Send any **PDF / DOCX / TXT / MD** file to the bot — it's parsed, chunked, embedded and indexed under your account only. Then just ask questions ("what does my lease say about deposits?") or request summaries. Documents are private per user; `search_documents`, `list_documents` and `summarize_document` tools ground the answers in your files with `filename · chunk` references.
 
+## 🖥️ Chainlit web UI (optional)
+
+A local ChatGPT-style web interface sharing the same brain, memory and documents as the bot:
+
+```bash
+# in .env → set CHAINLIT_PASSWORD (web is fail-closed without it)
+uv run chainlit run app.py --host 0.0.0.0 --port 8000
+```
+
+Then open `http://<your-machine-ip>:8000` on any LAN device, log in with `CHAINLIT_USERNAME` / `CHAINLIT_PASSWORD`. Attach PDF/DOCX/TXT/MD files directly in the chat to index them. Full markdown rendering — tables and headings look better here than in Telegram.
+
 ## 📡 Watching logs live
 
 ```bash
@@ -126,6 +137,7 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 
 ```
 main.py          Telegram adapter: handlers, auth, markdown→HTML pipeline
+app.py           Chainlit web UI adapter (password auth, file uploads)
 core.py          backend-agnostic agent brain (shared by all frontends)
 tools.py         nine agent tools (search + live facts + document RAG)
 docs.py          per-user document store (parse, chunk, embed, retrieve)
