@@ -100,10 +100,12 @@ A local ChatGPT-style web interface sharing the same brain, memory and documents
 
 ```bash
 # in .env → set CHAINLIT_PASSWORD (web is fail-closed without it)
-uv run chainlit run app.py --host 0.0.0.0 --port 8000 --headless
+python app.py            # serves http://localhost:8000
 ```
 
-Then open **http://localhost:8000** on this machine, or `http://<your-LAN-IP>:8000` from other devices (`ipconfig` → your Wi-Fi IPv4). Never browse to `0.0.0.0` itself — Windows rejects it; it only selects which interfaces listen. Log in with `CHAINLIT_USERNAME` / `CHAINLIT_PASSWORD`. Attach PDF/DOCX/TXT/MD files directly in the chat to index them. Full markdown rendering — tables and headings look better here than in Telegram.
+Open **http://localhost:8000** on this machine, or `http://<your-LAN-IP>:8000` from other devices (`ipconfig` → your Wi-Fi IPv4). Override host/port via `CHAINLIT_HOST` / `CHAINLIT_PORT`.
+
+> ℹ️ Launched through uvicorn directly rather than `chainlit run`: the CLI's `nest_asyncio` patching breaks async detection on Python 3.14 (`AsyncLibraryNotFoundError`). Log in with `CHAINLIT_USERNAME` / `CHAINLIT_PASSWORD`. Attach PDF/DOCX/TXT/MD files directly in the chat to index them. Full markdown rendering — tables and headings look better here than in Telegram.
 
 ## 📡 Watching logs live
 

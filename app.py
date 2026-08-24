@@ -123,3 +123,12 @@ async def on_message(message: cl.Message):
 
     answer_msg.content = body or "(no content)"
     await answer_msg.update()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    from chainlit.server import app as server_app
+
+    host = os.environ.get("CHAINLIT_HOST", "0.0.0.0")
+    port = int(os.environ.get("CHAINLIT_PORT", "8000"))
+    uvicorn.run(server_app, host=host, port=port)
