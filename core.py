@@ -27,6 +27,9 @@ from tools import (
     get_current_time,
     get_exchange_rate,
     get_weather,
+    list_documents,
+    search_documents,
+    summarize_document,
     web_search,
 )
 
@@ -61,6 +64,7 @@ NEVER call web_search for the current date, day of the week, or clock time; answ
 For math, logic puzzles, coding, translation, definitions of common concepts, and creative writing: answer directly from your own knowledge and NEVER call web_search.
 Use web_search ONLY when the question needs real-time information: news, prices, weather, sports scores, product rankings, or recent events.
 Dedicated tools give exact live facts and are preferred over web_search when they match: get_current_time for time or date anywhere in the world, date_calculator for calendar math, get_weather for current weather, get_exchange_rate for currency rates, get_crypto_price for cryptocurrency prices.
+For questions about files the user has uploaded, use search_documents; use list_documents to see which files exist and summarize_document to fetch one file's full text.
 When you do search: call web_search at most twice per question, never repeat a query you already tried, then answer using ONLY the results and cite them like [1][2].
 When judging search results, compare their dates against the current date and say so if they look outdated.
 If search results don't contain the answer, say you don't know instead of guessing.
@@ -74,7 +78,21 @@ logger = logging.getLogger(__name__)
 
 chat_histories: dict[str, list] = {}
 memory_store: MemoryStore | None = None
+doc_store = None
 _background_tasks: set = set()
+
+
+def init_docs(db_path: Path):
+    global doc_store
+    try:
+        from docs import DocStore
+        from tools import set_doc_store
+
+        store = DocStore(db_path)
+        doc_store = store
+        set_doc_store(store)
+    except Exception as e:
+        logger.warning("Document store init failed (%s); document tools disabled", e)
 
 
 def save_histories():
@@ -122,6 +140,9 @@ TOOLBELT = [
     get_weather,
     get_exchange_rate,
     get_crypto_price,
+    search_documents,
+    summarize_document,
+    list_documents,
 ]
 
 agent = create_react_agent(llm, tools=TOOLBELT)
@@ -142,9 +163,11 @@ def _tool_names(messages: list) -> list[str]:
     ]
 
 
-async def run_agent(messages: list) -> tuple[str, list[str]]:
+async def run_agent(messages: list, owner: str | None = None) -> tuple[str, list[str]]:
     generated: list = []
     config = {"recursion_limit": MAX_TOOL_ROUNDS * 2 + 4}
+    if owner:
+        config["configurable"] = {"doc_owner": str(owner)}
     try:
         async for update in agent.astream({"messages": messages}, config=config):
             for node_output in update.values():
@@ -229,7 +252,7 @@ def looks_like_failure(text: str) -> bool:
     )
 
 
-async def respond(session_key: str, text: str) -> tuple[str, list[str], bool]:
+async def respond(session_key: str, text: str, owner: str | None = None) -> tuple[str, list[str], bool]:
     history = chat_histories.setdefault(session_key, [])
     history.append(HumanMessage(content=text))
     trim_history(history)
@@ -253,7 +276,7 @@ async def respond(session_key: str, text: str) -> tuple[str, list[str], bool]:
     system_text = f"{SYSTEM_PROMPT}\n\n{preamble}"
     agent_messages = [SystemMessage(content=system_text)] + list(history)
 
-    raw_reply, sources = await run_agent(agent_messages)
+    raw_reply, sources = await run_agent(agent_messages, owner=owner)
     reply_md = enforce_identity(sanitize(raw_reply))
     sources = sources[:5]
 

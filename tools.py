@@ -1,14 +1,30 @@
 import logging
 from datetime import datetime, timedelta
+from typing import Annotated
 from zoneinfo import ZoneInfo
 
 import httpx
 from ddgs import DDGS
-from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import InjectedToolArg, tool
 
 logger = logging.getLogger(__name__)
 
 MAX_SEARCH_RESULTS = 5
+
+_DOC_STORE = None
+
+
+def set_doc_store(store) -> None:
+    global _DOC_STORE
+    _DOC_STORE = store
+
+
+def _cfg_owner(config) -> str | None:
+    try:
+        return ((config or {}).get("configurable") or {}).get("doc_owner")
+    except Exception:
+        return None
 
 
 @tool
@@ -148,3 +164,50 @@ def get_crypto_price(coin_id: str) -> str:
         return f"{coin}: ${usd:,.2f} USD / INR {inr:,.0f}"
     except Exception as e:
         return f"ERROR: could not fetch crypto price ({e})."
+
+
+@tool
+async def search_documents(query: str, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Searches inside the documents the user has uploaded (PDF, DOCX, TXT, MD).
+    Use for ANY question about the contents of the user's own files instead of web_search."""
+    if _DOC_STORE is None or not _DOC_STORE.enabled:
+        return "ERROR: document search is unavailable."
+    owner = _cfg_owner(config)
+    if not owner:
+        return "ERROR: no document owner context."
+    hits = await _DOC_STORE.search(owner, query)
+    if not hits:
+        return "No matching passages found in the uploaded documents."
+    blocks = [f"[{src} · chunk {idx}]\n{text}" for src, idx, text in hits]
+    return "\n\n".join(blocks)
+
+
+@tool
+async def list_documents(config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Lists every document the user has uploaded, with chunk counts.
+    Use when asked what files or documents exist."""
+    if _DOC_STORE is None or not _DOC_STORE.enabled:
+        return "ERROR: document storage is unavailable."
+    owner = _cfg_owner(config)
+    if not owner:
+        return "ERROR: no document owner context."
+    docs = await _DOC_STORE.list_docs(owner)
+    if not docs:
+        return "No documents uploaded yet."
+    return "\n".join(f"- {d['source']} ({d['chunks']} chunks, {d['date']})" for d in docs)
+
+
+@tool
+async def summarize_document(source: str, config: Annotated[RunnableConfig, InjectedToolArg]) -> str:
+    """Returns the readable text of ONE uploaded document by its exact name from
+    list_documents. Use for summarize/extract requests about a specific file."""
+    if _DOC_STORE is None or not _DOC_STORE.enabled:
+        return "ERROR: document storage is unavailable."
+    owner = _cfg_owner(config)
+    if not owner:
+        return "ERROR: no document owner context."
+    text, truncated = await _DOC_STORE.doc_text(owner, source)
+    if not text:
+        return f"ERROR: '{source}' not found or empty. Use list_documents for exact names."
+    note = "\n\n(NOTE: document was longer than this excerpt.)" if truncated else ""
+    return f"TEXT OF {source}:\n\n{text}{note}"

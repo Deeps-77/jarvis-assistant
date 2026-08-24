@@ -7,6 +7,7 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 ## ✨ Features
 
 - 🔍 **Web search fallback** — DuckDuckGo search for open-ended questions, answers cited with clickable sources
+- 📄 **Document Q&A (RAG)** — upload PDF/DOCX/TXT/MD, ask questions with per-user private indexing
 - 🧰 **Exact live-fact tools** — current time anywhere on Earth, calendar math, live weather (wttr.in), exchange rates (ECB), crypto prices (CoinGecko) — all keyless public APIs
 - 🧠 **Long-term semantic memory** — past exchanges are embedded and recalled when relevant, isolated per chat (sqlite-vec)
 - 📝 **Telegram-native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML: headings, lists, code blocks, tables, clickable source links
@@ -86,7 +87,12 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 | `/start` | allowed users | start a fresh conversation |
 | `/reset` | allowed users | clear the current chat window |
 | `/forget` | allowed users | clear the window **and** long-term memory |
+| `/docs` | allowed users | list your uploaded documents |
 | `/logs [n]` | owner only | last n activity lines sent as a message |
+
+### 📄 Documents
+
+Send any **PDF / DOCX / TXT / MD** file to the bot — it's parsed, chunked, embedded and indexed under your account only. Then just ask questions ("what does my lease say about deposits?") or request summaries. Documents are private per user; `search_documents`, `list_documents` and `summarize_document` tools ground the answers in your files with `filename · chunk` references.
 
 ## 📡 Watching logs live
 
@@ -119,9 +125,11 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ## 📁 Project layout
 
 ```
-main.py          entry point: handlers, guardrails, markdown→HTML pipeline
-tools.py         the six agent tools (search + five live-fact tools)
-memory.py        sqlite-vec long-term semantic memory
+main.py          Telegram adapter: handlers, auth, markdown→HTML pipeline
+core.py          backend-agnostic agent brain (shared by all frontends)
+tools.py         nine agent tools (search + live facts + document RAG)
+docs.py          per-user document store (parse, chunk, embed, retrieve)
+memory.py        sqlite-vec long-term conversational memory
 botlog.py        logging setup + human-readable event helpers
 watch_logs.py    colored terminal log follower
 ```

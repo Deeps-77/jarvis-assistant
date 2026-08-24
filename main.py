@@ -19,6 +19,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 MAX_MESSAGE_LEN = 4096
 TG_CHUNK_LIMIT = 4000
+DOCUMENTS_DIR = Path(__file__).parent / "documents"
+SUPPORTED_UPLOADS = {".pdf", ".docx", ".txt", ".md"}
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 _md_parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
 
@@ -452,7 +455,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id))
     try:
-        body, footer_sources, failed = await core.respond(str(chat_id), message.text)
+        body, footer_sources, failed = await core.respond(
+            str(chat_id), message.text, owner=str(update.effective_user.id)
+        )
         await send_html_reply(update, body, footer_sources)
         botlog.log_reply(
             time.perf_counter() - t_start,
@@ -462,6 +467,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         typing_task.cancel()
         core.save_histories()
+
+
+async def docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        botlog.log_denied(_user_name(update), update.effective_user.id)
+        await update.effective_message.reply_text(denial_text(update))
+        return
+    botlog.log_command("docs", _user_name(update), update.effective_user.id)
+    if not core.doc_store or not core.doc_store.enabled:
+        await update.effective_message.reply_text("⚠️ Document storage is unavailable.")
+        return
+    docs = await core.doc_store.list_docs(str(update.effective_user.id))
+    if not docs:
+        await update.effective_message.reply_text(
+            "No documents yet — send me a PDF, DOCX, TXT or MD file and I'll index it."
+        )
+        return
+    listing = "\n".join(f"📄 {d['source']} — {d['chunks']} chunks ({d['date']})" for d in docs)
+    await update.effective_message.reply_text(f"Your documents:\n{listing}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        botlog.log_denied(_user_name(update), update.effective_user.id)
+        await update.effective_message.reply_text(denial_text(update))
+        return
+    if not core.doc_store or not core.doc_store.enabled:
+        await update.effective_message.reply_text("⚠️ Document storage is unavailable right now.")
+        return
+
+    doc = update.effective_message.document
+    fname = os.path.basename(doc.file_name or "upload.bin")
+    suffix = Path(fname).suffix.lower()
+    user_id = update.effective_user.id
+    botlog.log_user_msg(
+        _user_name(update), user_id, _chat_desc(update), f"📎 uploaded {fname}"
+    )
+
+    if suffix not in SUPPORTED_UPLOADS:
+        await update.effective_message.reply_text(
+            f"Unsupported format '{suffix}'. I can index PDF, DOCX, TXT and MD files."
+        )
+        return
+    if (doc.file_size or 0) > MAX_UPLOAD_BYTES:
+        await update.effective_message.reply_text("File too large (limit 20 MB).")
+        return
+
+    typing_task = asyncio.create_task(typing_indicator(context.bot, update.effective_chat.id))
+    try:
+        tg_file = await doc.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+
+        DOCUMENTS_DIR.mkdir(exist_ok=True)
+        safe_name = f"{user_id}_{fname}"
+        (DOCUMENTS_DIR / safe_name).write_bytes(raw)
+
+        result = await core.doc_store.ingest(str(user_id), fname, raw)
+        status = result.get("status")
+        if status == "added":
+            await update.effective_message.reply_text(
+                f"✅ Indexed {fname} ({result['chunks']} chunks). Ask me anything about it!"
+            )
+        elif status == "unchanged":
+            await update.effective_message.reply_text(
+                f"✅ {fname} is already indexed — nothing new."
+            )
+        else:
+            await update.effective_message.reply_text(f"⚠️ {result.get('message', 'Indexing failed.')}")
+    except TimedOut:
+        await update.effective_message.reply_text("Download timed out — please resend the file.")
+    except Exception as e:
+        logger.exception("Document handling failed")
+        await update.effective_message.reply_text(f"⚠️ Could not process that file: {e}")
+    finally:
+        typing_task.cancel()
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -491,6 +571,8 @@ def main():
 
     core.load_histories()
     core.init_memory(Path(__file__).parent / "memory.db")
+    core.init_docs(Path(__file__).parent / "memory.db")
+    DOCUMENTS_DIR.mkdir(exist_ok=True)
 
     users_desc = "open to everyone" if allowed_ids is None else f"{len(allowed_ids)} allowlisted"
     botlog.log_startup(
@@ -518,7 +600,9 @@ def main():
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("docs", docs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_error_handler(error_handler)
 
     logger.info("Bot is running locally... Press Ctrl+C to stop.")

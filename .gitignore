@@ -16,3 +16,4 @@ wheels/
 chat_history.json*
 memory.db*
 logs/
+documents/
