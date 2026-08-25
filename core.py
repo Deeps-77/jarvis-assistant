@@ -95,6 +95,25 @@ def init_docs(db_path: Path):
         logger.warning("Document store init failed (%s); document tools disabled", e)
 
 
+speech_transcriber = None
+
+
+def init_speech():
+    global speech_transcriber
+    try:
+        from speech import SpeechTranscriber
+
+        speech_transcriber = SpeechTranscriber()
+    except Exception as e:
+        logger.warning("Speech init failed (%s); voice input disabled", e)
+
+
+async def transcribe_audio(data: bytes, filename: str) -> str:
+    if not speech_transcriber or not speech_transcriber.enabled:
+        return ""
+    return await speech_transcriber.transcribe(data, filename)
+
+
 async def ingest_document(owner: str, filename: str, raw: bytes) -> dict:
     if not doc_store or not doc_store.enabled:
         return {"status": "error", "message": "document storage is unavailable right now"}

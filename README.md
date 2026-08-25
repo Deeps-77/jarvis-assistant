@@ -8,6 +8,7 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 
 - 🔍 **Web search fallback** — DuckDuckGo search for open-ended questions, answers cited with clickable sources
 - 📄 **Document Q&A (RAG)** — upload PDF/DOCX/TXT/MD, ask questions with per-user private indexing
+- 🎤 **Voice input** — local faster-whisper transcription (Telegram voice notes, Chainlit mic + audio files)
 - 🧰 **Exact live-fact tools** — current time anywhere on Earth, calendar math, live weather (wttr.in), exchange rates (ECB), crypto prices (CoinGecko) — all keyless public APIs
 - 🧠 **Long-term semantic memory** — past exchanges are embedded and recalled when relevant, isolated per chat (sqlite-vec)
 - 📝 **Telegram-native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML: headings, lists, code blocks, tables, clickable source links
@@ -107,6 +108,10 @@ Open **http://localhost:8000** on this machine, or `http://<your-LAN-IP>:8000` f
 
 > ℹ️ Launched through uvicorn directly rather than `chainlit run`: the CLI's `nest_asyncio` patching breaks async detection on Python 3.14 (`AsyncLibraryNotFoundError`). Log in with `CHAINLIT_USERNAME` / `CHAINLIT_PASSWORD`. Attach PDF/DOCX/TXT/MD files directly in the chat to index them. Full markdown rendering — tables and headings look better here than in Telegram.
 
+### 🎤 Voice notes
+
+Telegram voice notes and Chainlit audio attachments (or the browser mic button) are transcribed locally by faster-whisper (`WHISPER_MODEL`, default `small`, int8 CPU with automatic CUDA when available — GPU detected on this machine). The transcript is echoed back ("🎤 I heard: …") and then answered through the full pipeline — search, live tools, documents, all of it.
+
 ## 📡 Watching logs live
 
 ```bash
@@ -139,11 +144,12 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 
 ```
 main.py          Telegram adapter: handlers, auth, markdown→HTML pipeline
-app.py           Chainlit web UI adapter (password auth, file uploads)
+app.py           Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
 core.py          backend-agnostic agent brain (shared by all frontends)
 tools.py         nine agent tools (search + live facts + document RAG)
 docs.py          per-user document store (parse, chunk, embed, retrieve)
 memory.py        sqlite-vec long-term conversational memory
+speech.py        whisper-based speech transcription
 botlog.py        logging setup + human-readable event helpers
 watch_logs.py    colored terminal log follower
 ```

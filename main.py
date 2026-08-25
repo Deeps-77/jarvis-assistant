@@ -544,6 +544,52 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        botlog.log_denied(_user_name(update), update.effective_user.id)
+        await update.effective_message.reply_text(denial_text(update))
+        return
+    if not core.speech_transcriber or not core.speech_transcriber.enabled:
+        await update.effective_message.reply_text("⚠️ Speech transcription is unavailable right now.")
+        return
+
+    msg = update.effective_message
+    audio = msg.voice or msg.audio
+    fname = getattr(audio, "file_name", None) or f"voice_{msg.message_id}.oga"
+    user_id = update.effective_user.id
+    botlog.log_user_msg(_user_name(update), user_id, _chat_desc(update), "🎤 voice message")
+    t_start = time.perf_counter()
+
+    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id := update.effective_chat.id))
+    try:
+        tg_file = await audio.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+
+        transcript = await core.transcribe_audio(raw, fname)
+        if not transcript:
+            await update.effective_message.reply_text(
+                "🎤 I couldn't make out any speech in that message. Try again a bit closer to the mic?"
+            )
+            return
+
+        echo = f"🎤 I heard: {_esc(transcript[:400])}"
+        try:
+            await update.effective_message.reply_text(echo, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            await update.effective_message.reply_text(f"🎤 I heard: {transcript[:400]}")
+
+        body, footer_sources, failed = await core.respond(str(chat_id), transcript, owner=str(user_id))
+        await send_html_reply(update, body, footer_sources)
+        botlog.log_reply(
+            time.perf_counter() - t_start,
+            len(footer_sources),
+            "ok" if not failed else "gated-fallback",
+        )
+    finally:
+        typing_task.cancel()
+        core.save_histories()
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling an update:", exc_info=context.error)
     botlog.log_error_note(f"{type(context.error).__name__}: {str(context.error)[:200]}")
@@ -572,6 +618,7 @@ def main():
     core.load_histories()
     core.init_memory(Path(__file__).parent / "memory.db")
     core.init_docs(Path(__file__).parent / "memory.db")
+    core.init_speech()
     DOCUMENTS_DIR.mkdir(exist_ok=True)
 
     users_desc = "open to everyone" if allowed_ids is None else f"{len(allowed_ids)} allowlisted"
@@ -602,6 +649,7 @@ def main():
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("docs", docs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_error_handler(error_handler)
 
