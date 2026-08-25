@@ -1,9 +1,10 @@
 import json
 import logging
 import os
+import re
 import secrets
 import sys
-import tomllib
+import time
 from pathlib import Path
 
 os.environ["LITERAL_TELEMETRY_OFF"] = "true"
@@ -15,49 +16,20 @@ logger = logging.getLogger(__name__)
 def _ensure_chainlit_config(base: Path):
     cfg = base / ".chainlit" / "config.toml"
     cfg.parent.mkdir(exist_ok=True)
-    data = {}
-    if cfg.exists():
-        try:
-            with open(cfg, "rb") as f:
-                data = tomllib.load(f)
-        except Exception:
-            data = {}
-
-    port = os.environ.get("CHAINLIT_PORT", "8000")
-
-    def set_path(d, path, value):
-        cur = d
-        for key in path[:-1]:
-            cur = cur.setdefault(key, {})
-        cur[path[-1]] = value
-
-    set_path(data, ["features", "audio", "enabled"], True)
-    set_path(data, ["STT", "enabled"], True)
-    set_path(data, ["STT", "engine"], "openai")
-    set_path(data, ["STT", "model"], "local-whisper")
-    set_path(data, ["OpenAI", "api_key"], "local-stt")
-    set_path(data, ["OpenAI", "base_url"], f"http://127.0.0.1:{port}/v1")
-
-    lines = []
-
-    def emit(table: dict, prefix: str):
-        for k, v in table.items():
-            if not isinstance(v, dict):
-                if isinstance(v, bool):
-                    lines.append(f"{k} = {'true' if v else 'false'}")
-                elif isinstance(v, (int, float)):
-                    lines.append(f"{k} = {v}")
-                else:
-                    lines.append(f"{k} = {json.dumps(str(v))}")
-        for k, v in table.items():
-            if isinstance(v, dict):
-                full = f"{prefix}{k}."
-                lines.append("")
-                lines.append(f"[{full.rstrip('.')}]")
-                emit(v, full)
-
-    emit(data, "")
-    cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if not cfg.exists():
+        cfg.write_text(
+            "[project]\n\n[features.audio]\nenabled = true\n"
+            "\n[features.spontaneous_file_upload]\nenabled = true\naccept = [\"*/*\"]\n",
+            encoding="utf-8",
+        )
+        return
+    text = cfg.read_text(encoding="utf-8")
+    if "[features.audio]" in text:
+        pat = re.compile(r"(\[features\.audio\][^\[]*?)enabled\s*=\s*\S+", re.DOTALL)
+        text = pat.sub(r"\g<1>enabled = true", text, count=1)
+    else:
+        text += "\n[features.audio]\nenabled = true\n"
+    cfg.write_text(text, encoding="utf-8")
 
 
 _ensure_chainlit_config(Path(__file__).parent / ".chainlit")
@@ -74,19 +46,51 @@ import chainlit as cl
 import core
 
 AUDIO_UPLOADS = {".oga", ".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
+SAMPLE_RATE = 24000
 
-try:
-    from chainlit.server import app as _server_app
-    from fastapi import File, UploadFile
+import io
+import wave
 
-    @_server_app.post("/v1/audio/transcriptions")
-    async def _voice_stt(file: UploadFile = File(...)):
-        data = await file.read()
-        text = await core.transcribe_audio(data, file.filename or "audio.ogg")
-        return {"text": text}
 
-except Exception as e:
-    logger.debug("STT route not mounted: %s", e)
+def _pcm_to_wav_bytes(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm)
+    return buffer.getvalue()
+
+
+_audio_buffers: dict[str, list[bytes]] = {}
+
+
+@cl.on_audio_start
+async def on_audio_start():
+    _audio_buffers[session_key()] = []
+
+
+@cl.on_audio_chunk
+async def on_audio_chunk(chunk) -> None:
+    data = getattr(chunk, "data", None)
+    if data:
+        _audio_buffers.setdefault(session_key(), []).append(data)
+
+
+@cl.on_audio_end
+async def on_audio_end():
+    ensure_setup()
+    chunks = _audio_buffers.pop(session_key(), [])
+    pcm = b"".join(chunks)
+    if not pcm:
+        await cl.Message(content="🎤 Empty recording.").send()
+        return
+    transcript = await core.transcribe_audio(_pcm_to_wav_bytes(pcm), "mic.wav")
+    if not transcript:
+        await cl.Message(content="🎤 I couldn't hear anything. Try again closer to the mic.").send()
+        return
+    await cl.Message(content=f"🎤 I heard: {transcript[:400]}").send()
+    await _respond_and_send(transcript)
 
 setup_done = False
 
@@ -198,16 +202,16 @@ async def on_message(message: cl.Message):
     text = message.content.strip() or " ".join(transcripts).strip()
     if not text:
         return
+    await _respond_and_send(text)
 
+
+async def _respond_and_send(text: str):
     answer_msg = cl.Message(content="")
     await answer_msg.send()
-
-    body, sources, failed = await core.respond(session_key(), text, owner=owner)
-
+    body, sources, failed = await core.respond(session_key(), text, owner=_username())
     if sources:
         links = "\n".join(f"[{i}] {url}" for i, url in enumerate(sources, start=1))
         body = f"{body}\n\n**Sources:**\n{links}"
-
     answer_msg.content = body or "(no content)"
     await answer_msg.update()
 
