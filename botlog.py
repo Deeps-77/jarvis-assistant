@@ -15,6 +15,32 @@ MAX_JSONL_BYTES = 10 * 1024 * 1024
 _activity = logging.getLogger("jarvis.activity")
 
 
+class _BenignSocketResetFilter(logging.Filter):
+    """Suppress Windows Proactor shutdown-race noise.
+
+    When a browser/socket.io client aborts a connection mid-teardown,
+    asyncio's cleanup logs a full ERROR traceback for the already-reset
+    socket (WinError 10054). Requests succeeded; the traceback is pure noise.
+    Everything else - including any other ConnectionResetError - passes.
+    """
+
+    MAX_CHAIN_DEPTH = 6
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info:
+            exc = record.exc_info[1]
+            depth = 0
+            while exc is not None and depth < self.MAX_CHAIN_DEPTH:
+                if isinstance(exc, ConnectionResetError) and getattr(exc, "winerror", None) == 10054:
+                    return False
+                nxt = exc.__cause__ or exc.__context__
+                if nxt is exc:
+                    break
+                exc = nxt
+                depth += 1
+        return True
+
+
 def setup_logging() -> None:
     LOGS_DIR.mkdir(exist_ok=True)
 
@@ -36,6 +62,7 @@ def setup_logging() -> None:
         logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
     )
     root.addHandler(diag_file)
+    logging.getLogger("asyncio").addFilter(_BenignSocketResetFilter())
 
     activity_file = TimedRotatingFileHandler(
         ACTIVITY_FILE, when="midnight", backupCount=30, encoding="utf-8"
