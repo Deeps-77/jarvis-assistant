@@ -106,6 +106,23 @@ python app.py            # serves http://localhost:8000
 
 Open **http://localhost:8000** on this machine, or `http://<your-LAN-IP>:8000` from other devices (`ipconfig` → your Wi-Fi IPv4). Override host/port via `CHAINLIT_HOST` / `CHAINLIT_PORT`.
 
+### 🎙️ Using the microphone from other devices (HTTPS)
+
+Browsers only allow microphone capture on **secure contexts**: `https://` pages, or plain `http://localhost`. The mic works out of the box on this machine, but is blocked when the UI is opened from other devices over plain HTTP.
+
+**Option 1 — built-in self-signed HTTPS**
+
+```bash
+# in .env → CHAINLIT_TLS=true
+python app.py
+```
+
+A certificate covering localhost + this machine's IPs is auto-generated into `.chainlit/certs/`. Then open **`https://<your-LAN-IP>:8000`** — each device shows a one-time *"Your connection is not private"* warning: click **Advanced → Proceed**. After that, the mic works permanently.
+
+**Option 2 — per-device browser flag (no HTTPS)**
+
+On each device, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, enter `http://<your-LAN-IP>:8000`, enable, and relaunch the browser. Mic then works over plain HTTP.
+
 > ℹ️ Launched through uvicorn directly rather than `chainlit run`: the CLI's `nest_asyncio` patching breaks async detection on Python 3.14 (`AsyncLibraryNotFoundError`). Log in with `CHAINLIT_USERNAME` / `CHAINLIT_PASSWORD`. Attach PDF/DOCX/TXT/MD files directly in the chat to index them. Full markdown rendering — tables and headings look better here than in Telegram.
 
 ### 🎤 Voice notes

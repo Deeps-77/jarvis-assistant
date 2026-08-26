@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,81 @@ def _ensure_translations(chainlit_dir: Path):
         target = tdir / f"{variant}.json"
         if not target.exists():
             target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _local_ipv4s() -> list[str]:
+    ips = set()
+    try:
+        host = socket.gethostname()
+        for info in socket.getaddrinfo(host, None, family=socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ips)
+
+
+def _ensure_tls(base: Path) -> tuple[Path, Path] | None:
+    """Generate a self-signed certificate covering localhost + this machine's IPs."""
+    if os.environ.get("CHAINLIT_TLS", "").strip().lower() not in ("true", "1", "yes"):
+        return None
+    certs = base / "certs"
+    certs.mkdir(exist_ok=True)
+    cert_file = certs / "jarvis.crt"
+    key_file = certs / "jarvis.key"
+    if cert_file.exists() and key_file.exists():
+        return cert_file, key_file
+
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Jarvis Local")])
+
+    san = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ]
+    try:
+        san.append(x509.DNSName(socket.gethostname()))
+    except (OSError, UnicodeError):
+        pass
+    for ip in _local_ipv4s():
+        try:
+            san.append(x509.IPAddress(ipaddress.ip_address(ip)))
+        except ValueError:
+            pass
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(san), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    logger.info(
+        "Self-signed TLS certificate generated (%s) covering: %s",
+        cert_file,
+        ", ".join(str(n.value) for n in san),
+    )
+    return cert_file, key_file
 
 
 def _ensure_chainlit_config(base: Path):
@@ -235,4 +311,15 @@ if __name__ == "__main__":
 
     host = os.environ.get("CHAINLIT_HOST", "0.0.0.0")
     port = int(os.environ.get("CHAINLIT_PORT", "8000"))
-    uvicorn.run(server_app, host=host, port=port)
+
+    kwargs = {}
+    tls = _ensure_tls(Path(__file__).parent)
+    if tls:
+        kwargs["ssl_certfile"] = str(tls[0])
+        kwargs["ssl_keyfile"] = str(tls[1])
+        logger.info(
+            "HTTPS enabled - open https://localhost:%d (accept the self-signed certificate warning once per device)",
+            port,
+        )
+
+    uvicorn.run(server_app, host=host, port=port, **kwargs)
