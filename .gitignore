@@ -21,3 +21,4 @@ documents/
 .files/
 .chainlit.secret
 session-ses_*.md
+certs/
