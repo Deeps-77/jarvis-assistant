@@ -306,20 +306,50 @@ async def _respond_and_send(text: str):
 
 
 if __name__ == "__main__":
+    import threading
+
     import uvicorn
     from chainlit.server import app as server_app
+    from starlette.applications import Starlette
+    from starlette.responses import RedirectResponse
 
     host = os.environ.get("CHAINLIT_HOST", "0.0.0.0")
-    port = int(os.environ.get("CHAINLIT_PORT", "8000"))
+    base_port = int(os.environ.get("CHAINLIT_PORT", "8000"))
 
-    kwargs = {}
     tls = _ensure_tls(Path(__file__).parent)
-    if tls:
-        kwargs["ssl_certfile"] = str(tls[0])
-        kwargs["ssl_keyfile"] = str(tls[1])
-        logger.info(
-            "HTTPS enabled - open https://localhost:%d (accept the self-signed certificate warning once per device)",
-            port,
-        )
+    if not tls:
+        logger.info("HTTP mode - open http://localhost:%d", base_port)
+        uvicorn.run(server_app, host=host, port=base_port)
+    else:
+        cert_file, key_file = tls
+        tls_port = int(os.environ.get("CHAINLIT_TLS_PORT", "8443"))
 
-    uvicorn.run(server_app, host=host, port=port, **kwargs)
+        from fastapi import FastAPI, Request
+
+        redirect_app = FastAPI()
+
+        @redirect_app.api_route(
+            "/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        )
+        async def _redirect_to_https(request: Request, path: str):
+            hostname = (request.headers.get("host") or "localhost").split(":")[0]
+            query = f"?{request.url.query}" if request.url.query else ""
+            return RedirectResponse(
+                url=f"https://{hostname}:{tls_port}/{path}{query}", status_code=307
+            )
+
+        threading.Thread(
+            target=uvicorn.run,
+            args=(redirect_app,),
+            kwargs={"host": host, "port": base_port, "log_level": "warning"},
+            daemon=True,
+        ).start()
+
+        logger.info(
+            "HTTPS enabled - open https://localhost:%d "
+            "(accept the self-signed certificate warning once per device); "
+            "http://localhost:%d now redirects there.",
+            tls_port, base_port,
+        )
+        uvicorn.run(server_app, host=host, port=tls_port, ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
