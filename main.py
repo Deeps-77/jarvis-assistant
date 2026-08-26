@@ -488,6 +488,16 @@ async def docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Your documents:\n{listing}")
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if owner_id is None or user_id != owner_id:
+        botlog.log_denied(_user_name(update), user_id)
+        await update.effective_message.reply_text("⛔ /stats is restricted to the bot owner.")
+        return
+    botlog.log_command("stats", _user_name(update), user_id)
+    await update.effective_message.reply_text(botlog.get_stats())
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         botlog.log_denied(_user_name(update), update.effective_user.id)
@@ -647,6 +657,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("logs", logs_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("docs", docs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))

@@ -117,7 +117,9 @@ async def transcribe_audio(data: bytes, filename: str) -> str:
 async def ingest_document(owner: str, filename: str, raw: bytes) -> dict:
     if not doc_store or not doc_store.enabled:
         return {"status": "error", "message": "document storage is unavailable right now"}
-    return await doc_store.ingest(owner, filename, raw)
+    result = await doc_store.ingest(owner, filename, raw)
+    botlog.log_doc(owner, filename, result.get("status", "error"), result.get("chunks", 0))
+    return result
 
 
 def save_histories():

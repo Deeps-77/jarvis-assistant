@@ -138,6 +138,14 @@ python watch_logs.py --lines 50
 
 Log files land in `logs/`, rotate at midnight, and are kept for 30 days. Written in real time — follow them from a second terminal while the bot runs.
 
+| File | Content |
+|---|---|
+| `logs/activity.log` | human-readable diary: 👤 messages, 🎤 transcriptions, 💬 replies w/ timing, 🔧 tool usage, 📄 document indexing, 🛡️ denials, ⌨️ commands |
+| `logs/jarvis.log` | full diagnostics with timestamps |
+| `logs/events.jsonl` | machine-readable event stream (one JSON per event) |
+
+**Usage analytics**: the owner can send `/stats` anytime for a same-day summary (messages per user, replies, voice notes, top tools, documents, gated failures). Stats are rebuilt from `events.jsonl`, so they survive restarts.
+
 ## 🔄 Swapping models
 
 ```bash

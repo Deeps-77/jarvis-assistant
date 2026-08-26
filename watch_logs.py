@@ -31,10 +31,14 @@ def colorize(line: str) -> str:
         c = "yellow"
     elif "denied" in low or "🛡" in line:
         c = "magenta"
-    elif "👤" in line:
+    elif "👤" in line or "🔑" in line:
         c = "cyan"
     elif "💬 reply" in low or "✅" in line:
         c = "green"
+    elif line.startswith(("📄", "🎙", "🔧")):
+        c = "cyan"
+    elif line.startswith("📊"):
+        c = "grey"
     elif line.startswith("─"):
         c = "grey"
     else:

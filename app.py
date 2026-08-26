@@ -131,6 +131,7 @@ os.environ.setdefault(
 
 import chainlit as cl
 
+import botlog
 import core
 
 AUDIO_UPLOADS = {".oga", ".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
@@ -211,7 +212,9 @@ def auth_callback(username: str, password: str):
         print("CHAINLIT_PASSWORD is not set - web access denied (fail-closed).")
         return None
     if username == _username() and password == expected:
+        botlog.log_web_login(username)
         return cl.User(identifier=username)
+    botlog.log_denied(username, "web")
     return None
 
 
@@ -291,18 +294,34 @@ async def on_message(message: cl.Message):
     text = message.content.strip() or " ".join(transcripts).strip()
     if not text:
         return
+
+    kind = "voice" if (transcripts and not message.content.strip()) else "text"
+    preview = text if kind == "text" else " ".join(transcripts)
+    botlog.log_user_msg(owner, "-", "web UI", preview, kind=kind)
+
     await _respond_and_send(text)
 
 
 async def _respond_and_send(text: str):
     answer_msg = cl.Message(content="")
     await answer_msg.send()
-    body, sources, failed = await core.respond(session_key(), text, owner=_username())
+    t0 = time.perf_counter()
+    try:
+        body, sources, failed = await core.respond(session_key(), text, owner=_username())
+    except Exception as e:
+        botlog.log_error_note(f"{type(e).__name__}: {str(e)[:200]}")
+        await cl.Message(content="⚠️ Something went wrong processing that.").send()
+        return
     if sources:
         links = "\n".join(f"[{i}] {url}" for i, url in enumerate(sources, start=1))
         body = f"{body}\n\n**Sources:**\n{links}"
     answer_msg.content = body or "(no content)"
     await answer_msg.update()
+    botlog.log_reply(
+        time.perf_counter() - t0,
+        len(sources),
+        "ok" if not failed else "gated-fallback",
+    )
 
 
 if __name__ == "__main__":

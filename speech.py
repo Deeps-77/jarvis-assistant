@@ -5,6 +5,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import botlog
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +93,9 @@ class SpeechTranscriber:
                     text, info = await asyncio.to_thread(_run)
                 else:
                     raise
+            audio_s = float(getattr(info, "duration", 0) or 0)
+            engine = f"whisper-{self.model_name}:{self.device}"
+            botlog.log_transcribe(audio_s, len(text), engine)
             logger.info(
                 "Transcribed %s (%.1fs audio, lang=%s) -> %d chars in %.1fs",
                 filename, getattr(info, "duration", 0), getattr(info, "language", "?"),
