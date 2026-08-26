@@ -114,6 +114,58 @@ async def transcribe_audio(data: bytes, filename: str) -> str:
     return await speech_transcriber.transcribe(data, filename)
 
 
+async def vision_respond(
+    session_key: str,
+    owner: str,
+    image_bytes: bytes,
+    image_fmt: str,
+    question: str,
+) -> tuple[str, bool]:
+    history = chat_histories.setdefault(session_key, [])
+
+    now = datetime.now().astimezone()
+    system_text = (
+        f"{VISION_SYSTEM_PROMPT}\n\n"
+        f"Current date and time: {now:%A}, {now:%d %B %Y}. Trust this."
+    )
+    import base64
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    user_content = [
+        {"type": "text", "text": question or "Describe this image in detail."},
+        {"type": "image_url", "image_url": {"url": f"data:image/{image_fmt};base64,{b64}"}},
+    ]
+    messages = [
+        SystemMessage(content=system_text),
+        HumanMessage(content=user_content),
+    ]
+
+    raw_reply = ""
+    try:
+        resp = await vision_llm.ainvoke(messages)
+        raw_reply = content_to_str(getattr(resp, "content", "") or "")
+    except Exception as e:
+        logger.warning("Vision model call failed: %s", e)
+        return (
+            f"⚠️ Vision model '{VISION_MODEL}' is unavailable ({str(e)[:120]}). "
+            "Pull it with `ollama pull` or change OLLAMA_VISION_MODEL.",
+            True,
+        )
+
+    reply_md = enforce_identity(sanitize(raw_reply))
+    failed = looks_like_failure(reply_md) or not reply_md
+    if failed:
+        body = "I couldn't analyze that image reliably. Try a clearer photo?"
+        stored_reply = body
+    else:
+        body = reply_md
+        stored_reply = f"[image] {question}\n{reply_md}"
+
+    history.extend([HumanMessage(content=f"[image attached] {question}"), AIMessage(content=stored_reply)])
+    trim_history(history)
+    return body, failed
+
+
 async def ingest_document(owner: str, filename: str, raw: bytes) -> dict:
     if not doc_store or not doc_store.enabled:
         return {"status": "error", "message": "document storage is unavailable right now"}
@@ -159,6 +211,22 @@ def clear_session(session_key: str):
 
 
 llm = ChatOllama(model=MODEL_NAME, temperature=0.2, num_ctx=8192, timeout=600, keep_alive=-1)
+
+VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "granite3.2-vision:2b")
+VISION_KEEP_ALIVE = os.environ.get("OLLAMA_VISION_KEEP_ALIVE", "10m")
+vision_llm = ChatOllama(
+    model=VISION_MODEL,
+    num_ctx=4096,
+    timeout=600,
+    keep_alive=VISION_KEEP_ALIVE,
+)
+
+VISION_SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant. The user shared an image with you.
+Identity rules: your name is Jarvis; never mention your underlying model or its maker.
+Analyze exactly what is visible in the image. Be precise and factual about objects, text, colors, people-count, charts and layout.
+If asked to extract or transcribe text from the image, do so verbatim where possible.
+If something is unclear or unreadable, say so instead of guessing.
+Never invent details that are not visible."""
 
 TOOLBELT = [
     web_search,

@@ -8,6 +8,7 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 
 - 🔍 **Web search fallback** — DuckDuckGo search for open-ended questions, answers cited with clickable sources
 - 📄 **Document Q&A (RAG)** — upload PDF/DOCX/TXT/MD, ask questions with per-user private indexing
+- 🖼️ **Image understanding** — attach photos/screenshots/charts on Telegram or web; a local vision model (granite3.2-vision) analyzes what's actually visible
 - 🎤 **Voice input** — local faster-whisper transcription (Telegram voice notes, Chainlit mic + audio files)
 - 🧰 **Exact live-fact tools** — current time anywhere on Earth, calendar math, live weather (wttr.in), exchange rates (ECB), crypto prices (CoinGecko) — all keyless public APIs
 - 🧠 **Long-term semantic memory** — past exchanges are embedded and recalled when relevant, isolated per chat (sqlite-vec)

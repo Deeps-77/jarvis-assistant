@@ -554,6 +554,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         typing_task.cancel()
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        botlog.log_denied(_user_name(update), update.effective_user.id)
+        await update.effective_message.reply_text(denial_text(update))
+        return
+
+    msg = update.effective_message
+    user_id = update.effective_user.id
+    caption = (msg.caption or "").strip()
+    botlog.log_user_msg(
+        _user_name(update), user_id, _chat_desc(update), f"🖼️ photo {caption}".strip() or "🖼️ photo"
+    )
+
+    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id := update.effective_chat.id))
+    t_start = time.perf_counter()
+    try:
+        biggest = msg.photo[-1]
+        tg_file = await biggest.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        question = caption or "Describe this image in detail."
+        body, failed = await core.vision_respond(
+            str(chat_id), str(user_id), raw, "jpeg", question
+        )
+        await send_html_reply(update, body)
+        botlog.log_reply(
+            time.perf_counter() - t_start,
+            0,
+            "ok" if not failed else "vision-error",
+        )
+    finally:
+        typing_task.cancel()
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         botlog.log_denied(_user_name(update), update.effective_user.id)
@@ -661,6 +694,7 @@ def main():
     app.add_handler(CommandHandler("docs", docs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_error_handler(error_handler)
 

@@ -257,13 +257,24 @@ def session_key() -> str:
     return key
 
 
-async def handle_attachments(elements) -> tuple[list[str], list[str]]:
+IMAGE_UPLOADS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+async def handle_attachments(elements) -> tuple[list[str], list[str], list[tuple[str, bytes, str]]]:
     confirmations: list[str] = []
     transcripts: list[str] = []
+    images: list[tuple[str, bytes, str]] = []
     for el in elements or []:
         path = getattr(el, "path", None)
         name = getattr(el, "name", None) or "upload.bin"
         suffix = Path(name).suffix.lower()
+
+        if suffix in IMAGE_UPLOADS:
+            if not path or not Path(path).exists():
+                confirmations.append(f"⚠️ {name}: file missing on server")
+                continue
+            images.append((name, Path(path).read_bytes(), suffix.lstrip(".")))
+            continue
 
         if suffix in AUDIO_UPLOADS:
             if not path or not Path(path).exists():
@@ -292,7 +303,7 @@ async def handle_attachments(elements) -> tuple[list[str], list[str]]:
             confirmations.append(f"✅ {name} already indexed")
         else:
             confirmations.append(f"⚠️ {name}: {result.get('message', 'failed')}")
-    return confirmations, transcripts
+    return confirmations, transcripts, images
 
 
 @cl.on_chat_start
@@ -332,8 +343,9 @@ async def on_message(message: cl.Message):
 
     notes: list[str] = []
     transcripts: list[str] = []
+    images: list[tuple[str, bytes, str]] = []
     if message.elements:
-        notes, transcripts = await handle_attachments(message.elements)
+        notes, transcripts, images = await handle_attachments(message.elements)
 
     if notes:
         await cl.Message(content="\n".join(notes)).send()
@@ -341,6 +353,16 @@ async def on_message(message: cl.Message):
         await cl.Message(content=f"🎤 I heard: {t[:400]}").send()
 
     text = message.content.strip() or " ".join(transcripts).strip()
+
+    if images:
+        name, raw, fmt = images[0]
+        question = text or "Describe this image in detail."
+        botlog.log_user_msg(owner, "-", "web UI", f"🖼️ {name}: {question}", kind="image")
+        body, failed = await core.vision_respond(session_key(), owner, raw, fmt, question)
+        await cl.Message(content=body).send()
+        botlog.log_reply(0, 0, "ok" if not failed else "vision-error")
+        return
+
     if not text:
         return
 
