@@ -146,8 +146,15 @@ async def vision_respond(
         raw_reply = content_to_str(getattr(resp, "content", "") or "")
     except Exception as e:
         logger.warning("Vision model call failed: %s", e)
+        msg = str(e)
+        if "context size" in msg and "increase" in msg:
+            return (
+                "⚠️ That image needs more context than the vision window currently allows "
+                "(run: `OLLAMA_VISION_CTX=16384` in your .env, or share a smaller/cropped image).",
+                True,
+            )
         return (
-            f"⚠️ Vision model '{VISION_MODEL}' is unavailable ({str(e)[:120]}). "
+            f"⚠️ Vision model '{VISION_MODEL}' is unavailable ({msg[:120]}). "
             "Pull it with `ollama pull` or change OLLAMA_VISION_MODEL.",
             True,
         )
@@ -214,9 +221,10 @@ llm = ChatOllama(model=MODEL_NAME, temperature=0.2, num_ctx=8192, timeout=600, k
 
 VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "granite3.2-vision:2b")
 VISION_KEEP_ALIVE = os.environ.get("OLLAMA_VISION_KEEP_ALIVE", "10m")
+VISION_CTX = int(os.environ.get("OLLAMA_VISION_CTX", "8192"))
 vision_llm = ChatOllama(
     model=VISION_MODEL,
-    num_ctx=4096,
+    num_ctx=VISION_CTX,
     timeout=600,
     keep_alive=VISION_KEEP_ALIVE,
 )

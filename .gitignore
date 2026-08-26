@@ -22,3 +22,4 @@ documents/
 .chainlit.secret
 session-ses_*.md
 certs/
+chat_threads.db*
