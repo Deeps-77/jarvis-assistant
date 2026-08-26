@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 logger = logging.getLogger(__name__)
 
 
-def _ensure_translations(base: Path):
-    tdir = base / ".chainlit" / "translations"
+def _ensure_translations(chainlit_dir: Path):
+    tdir = chainlit_dir / "translations"
     source = tdir / "en-US.json"
     if not source.exists():
         return
