@@ -68,6 +68,7 @@ _audio_buffers: dict[str, list[bytes]] = {}
 @cl.on_audio_start
 async def on_audio_start():
     _audio_buffers[session_key()] = []
+    return True
 
 
 @cl.on_audio_chunk
