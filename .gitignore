@@ -20,6 +20,4 @@ documents/
 .chainlit/
 .files/
 .chainlit.secret
-
-chainlit.md
 session-ses_*.md

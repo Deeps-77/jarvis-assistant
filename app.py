@@ -13,6 +13,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 logger = logging.getLogger(__name__)
 
 
+def _ensure_translations(base: Path):
+    tdir = base / ".chainlit" / "translations"
+    source = tdir / "en-US.json"
+    if not source.exists():
+        return
+    for variant in ("en-IN", "en-GB"):
+        target = tdir / f"{variant}.json"
+        if not target.exists():
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
 def _ensure_chainlit_config(base: Path):
     cfg = base / ".chainlit" / "config.toml"
     cfg.parent.mkdir(exist_ok=True)
@@ -30,6 +41,7 @@ def _ensure_chainlit_config(base: Path):
     else:
         text += "\n[features.audio]\nenabled = true\n"
     cfg.write_text(text, encoding="utf-8")
+    _ensure_translations(base)
 
 
 _ensure_chainlit_config(Path(__file__).parent / ".chainlit")
