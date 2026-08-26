@@ -130,6 +130,8 @@ os.environ.setdefault(
 )
 
 import chainlit as cl
+from chainlit.types import ThreadDict
+from langchain_core.messages import AIMessage, HumanMessage
 
 import botlog
 import core
@@ -193,8 +195,35 @@ def ensure_setup():
         core.init_memory(base / "memory.db")
         core.init_docs(base / "memory.db")
         core.init_speech()
+        from datalayer import SQLiteDataLayer
+
+        cl.data_layer = SQLiteDataLayer(base / "chat_threads.db")
         (base / "documents").mkdir(exist_ok=True)
         setup_done = True
+
+
+def current_session_key() -> str:
+    key = cl.user_session.get("session_key")
+    if not key:
+        import uuid
+
+        key = f"web:{uuid.uuid4().hex[:12]}"
+        cl.user_session.set("session_key", key)
+    return key
+
+
+def _rebuild_history_from_steps(steps) -> list:
+    msgs: list = []
+    for s in steps or []:
+        stype = s.get("type")
+        content = (s.get("output") or s.get("input") or "").strip()
+        if not content:
+            continue
+        if stype == "user_message":
+            msgs.append(HumanMessage(content=content))
+        elif stype == "assistant_message":
+            msgs.append(AIMessage(content=content))
+    return msgs[-core.MAX_HISTORY_MESSAGES:]
 
 
 def _password() -> str:
@@ -222,7 +251,10 @@ SUPPORTED_UPLOADS = {".pdf", ".docx", ".txt", ".md"}
 
 
 def session_key() -> str:
-    return f"web:{_username()}"
+    key = cl.user_session.get("session_key")
+    if not key:
+        key = current_session_key()
+    return key
 
 
 async def handle_attachments(elements) -> tuple[list[str], list[str]]:
@@ -271,8 +303,25 @@ async def on_chat_start():
             f"Hello! I'm Jarvis, running locally on this machine.\n\n"
             f"- Ask me anything — I'll search the web when needed.\n"
             f"- Attach a **PDF / DOCX / TXT / MD** file and I'll index it for Q&A.\n"
-            f"- Type `list my documents` to see what's indexed."
+            f"- Attach an **image** and I'll analyze it.\n"
+            f"- Type `list my documents` to see what's indexed.\n"
+            f"- Your past conversations appear in the sidebar — click to resume."
         )
+    ).send()
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: "ThreadDict"):
+    ensure_setup()
+    thread_id = thread["id"]
+    cl.user_session.set("session_key", f"thread:{thread_id}")
+
+    history = _rebuild_history_from_steps(thread.get("steps"))
+    core.chat_histories[f"thread:{thread_id}"] = history
+
+    await cl.Message(
+        content=f"📂 Resumed **{thread.get('name') or 'conversation'}** "
+        f"({len(history)} messages of context restored). Continue where we left off!"
     ).send()
 
 
