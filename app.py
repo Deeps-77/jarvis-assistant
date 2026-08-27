@@ -135,6 +135,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 import botlog
 import core
+from datalayer import SQLiteDataLayer
+
+
+@cl.data_layer
+def get_data_layer():
+    return SQLiteDataLayer(Path(__file__).parent / "chat_threads.db")
 
 AUDIO_UPLOADS = {".oga", ".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
 SAMPLE_RATE = 24000
@@ -195,9 +201,6 @@ def ensure_setup():
         core.init_memory(base / "memory.db")
         core.init_docs(base / "memory.db")
         core.init_speech()
-        from datalayer import SQLiteDataLayer
-
-        cl.data_layer = SQLiteDataLayer(base / "chat_threads.db")
         (base / "documents").mkdir(exist_ok=True)
         setup_done = True
 
@@ -409,7 +412,9 @@ if __name__ == "__main__":
     tls = _ensure_tls(Path(__file__).parent)
     if not tls:
         logger.info("HTTP mode - open http://localhost:%d", base_port)
-        uvicorn.run(server_app, host=host, port=base_port)
+        uvicorn.run(
+            server_app, host=host, port=base_port, timeout_graceful_shutdown=5
+        )
     else:
         cert_file, key_file = tls
         tls_port = int(os.environ.get("CHAINLIT_TLS_PORT", "8443"))
@@ -442,4 +447,11 @@ if __name__ == "__main__":
             "http://localhost:%d now redirects there.",
             tls_port, base_port,
         )
-        uvicorn.run(server_app, host=host, port=tls_port, ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
+        uvicorn.run(
+            server_app,
+            host=host,
+            port=tls_port,
+            ssl_certfile=str(cert_file),
+            ssl_keyfile=str(key_file),
+            timeout_graceful_shutdown=5,
+        )

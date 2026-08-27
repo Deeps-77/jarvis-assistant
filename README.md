@@ -1,6 +1,6 @@
-# 🤖 Jarvis — Local-First AI Assistant for Telegram
+# 🤖 Jarvis — Local-First AI Assistant (Telegram + Web)
 
-A privacy-first Telegram bot that runs **entirely on your own machine**: a local LLM served by [Ollama](https://ollama.com), web search when needed, exact live-fact tools, long-term semantic memory, and Telegram-native markdown rendering.
+A privacy-first AI assistant that runs **entirely on your own machine** and is reachable from **both Telegram and a local Chainlit web UI**: a local LLM served by [Ollama](https://ollama.com), web search when needed, exact live-fact tools, long-term semantic memory, and native markdown rendering on each frontend.
 
 No cloud AI APIs. No per-token costs. Your conversations never leave your hardware.
 
@@ -8,11 +8,11 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 
 - 🔍 **Web search fallback** — DuckDuckGo search for open-ended questions, answers cited with clickable sources
 - 📄 **Document Q&A (RAG)** — upload PDF/DOCX/TXT/MD, ask questions with per-user private indexing
-- 🖼️ **Image understanding** — attach photos/screenshots/charts on Telegram or web; a local vision model (granite3.2-vision) analyzes what's actually visible
+- 🖼️ **Image understanding** — attach photos/screenshots/charts from Telegram or the web UI; a local vision model (granite3.2-vision) analyzes what's actually visible
 - 🎤 **Voice input** — local faster-whisper transcription (Telegram voice notes, Chainlit mic + audio files)
 - 🧰 **Exact live-fact tools** — current time anywhere on Earth, calendar math, live weather (wttr.in), exchange rates (ECB), crypto prices (CoinGecko) — all keyless public APIs
 - 🧠 **Long-term semantic memory** — past exchanges are embedded and recalled when relevant, isolated per chat (sqlite-vec)
-- 📝 **Telegram-native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML: headings, lists, code blocks, tables, clickable source links
+- 📝 **Native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML (headings, lists, code blocks, tables, clickable source links); the web UI renders full Markdown directly
 - 🛡️ **Anti-hallucination guardrails** — per-turn date grounding, output sanity gate, tool-round caps with forced grounding, "say you don't know" instructions
 - 👥 **Allowlist access control** — only people you approve can talk to it; first allowlisted ID is the owner
 - 📊 **Human-readable logs** — emoji-rich daily log files, a colored terminal tail, and a `/logs` command for the owner
@@ -20,24 +20,29 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 ## 🏗️ How it works
 
 ```
-Telegram ⇄ python-telegram-bot
-                │
-                ▼
-      LangGraph ReAct agent  ◄── single system prompt (persona + live clock)
-        │             │
-        │             ├── web_search ────────► DuckDuckGo
-        │             ├── get_current_time ──► stdlib zoneinfo (offline)
-        │             ├── date_calculator ───► stdlib datetime (offline)
-        │             ├── get_weather ────────► wttr.in
-        │             ├── get_exchange_rate ─► frankfurter.dev (ECB)
-        │             └── get_crypto_price ──► CoinGecko
-        ▼
-   Ollama LLM (local)
+            ┌─────────────────────────┐      ┌─────────────────────────┐
+   You ───► │ Telegram (main.py)      │      │ Chainlit web UI         │◄─── You
+            │ python-telegram-bot,    │      │ (app.py: password auth, │
+            │ handlers + markdown→HTML│      │  file/audio upload, mic)│
+            └────────────┬────────────┘      └────────────┬────────────┘
+                         │                                │
+                         └───────────────┬────────────────┘
+                                         ▼
+                          core.py — LangGraph ReAct agent  ◄── single system prompt (persona + live clock)
+                            │             │
+                            │             ├── web_search ────────► DuckDuckGo
+                            │             ├── get_current_time ──► stdlib zoneinfo (offline)
+                            │             ├── date_calculator ───► stdlib datetime (offline)
+                            │             ├── get_weather ────────► wttr.in
+                            │             ├── get_exchange_rate ─► frankfurter.dev (ECB)
+                            │             └── get_crypto_price ──► CoinGecko
+                            ▼
+                       Ollama LLM (local)
 
-   sqlite-vec memory ◄── embedded exchanges, per-chat isolation
+            sqlite-vec memory ◄── embedded exchanges, per-chat isolation (shared by both frontends)
 ```
 
-Every turn is grounded with the real current date/time, the agent chooses between dedicated tools and web search, answers pass a sanity gate, get converted to Telegram HTML, and flow into per-chat vector memory.
+Both frontends talk to the same `core.py` brain, so they share memory, documents and tools. Every turn is grounded with the real current date/time, the agent chooses between dedicated tools and web search, answers pass a sanity gate, get rendered natively for each frontend (Telegram HTML or web Markdown), and flow into per-chat vector memory.
 
 ## 📋 Requirements
 
@@ -46,14 +51,15 @@ Every turn is grounded with the real current date/time, the agent chooses betwee
 | Python **3.14+** | easiest via [uv](https://docs.astral.sh/uv/) |
 | [uv](https://docs.astral.sh/uv/) | package manager |
 | [Ollama](https://ollama.com/download) | runs the models locally |
-| Telegram bot token | from [@BotFather](https://t.me/BotFather) |
+| Telegram bot token | from [@BotFather](https://t.me/BotFather) — **only needed for the Telegram frontend** |
+| `CHAINLIT_PASSWORD` | **only needed for the web UI** — set in `.env`; web is fail-closed without it |
 
 ## 🚀 Quick start
 
 ```bash
 # 1. Clone and install dependencies
-git clone https://github.com/Deeps-77/jarvis-telegram-bot.git
-cd jarvis-telegram-bot
+git clone https://github.com/Deeps-77/jarvis-assistant.git
+cd jarvis-assistant
 uv sync
 
 # 2. Pull the models into Ollama
@@ -96,9 +102,9 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 
 Send any **PDF / DOCX / TXT / MD** file to the bot — it's parsed, chunked, embedded and indexed under your account only. Then just ask questions ("what does my lease say about deposits?") or request summaries. Documents are private per user; `search_documents`, `list_documents` and `summarize_document` tools ground the answers in your files with `filename · chunk` references.
 
-## 🖥️ Chainlit web UI (optional)
+## 🖥️ Chainlit web UI
 
-A local ChatGPT-style web interface sharing the same brain, memory and documents as the bot:
+A local ChatGPT-style web interface that shares the **same brain, memory and documents** as the Telegram bot — the two frontends are fully interchangeable:
 
 ```bash
 # in .env → set CHAINLIT_PASSWORD (web is fail-closed without it)
