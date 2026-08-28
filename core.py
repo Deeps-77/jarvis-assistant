@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -51,10 +52,9 @@ def load_env_file(env_path: Path | None = None):
 load_env_file()
 
 MODEL_NAME = os.environ.get("OLLAMA_MODEL", "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:latest")
-print(MODEL_NAME)
 HISTORY_FILE = Path(__file__).parent / "chat_history.json"
 
-SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant on Telegram.
+SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant.
 Identity rules:
 - Your name is Jarvis.Never mention your underlying model or its maker.
 - If asked who you are, what your name is, or what model you are, you simply say you are Jarvis.
@@ -128,8 +128,6 @@ async def vision_respond(
         f"{VISION_SYSTEM_PROMPT}\n\n"
         f"Current date and time: {now:%A}, {now:%d %B %Y}. Trust this."
     )
-    import base64
-
     b64 = base64.b64encode(image_bytes).decode("ascii")
     user_content = [
         {"type": "text", "text": question or "Describe this image in detail."},
@@ -279,6 +277,8 @@ async def run_agent(messages: list, owner: str | None = None) -> tuple[str, list
                 elif isinstance(node_output, dict) and "messages" in node_output:
                     generated.extend(node_output["messages"])
         botlog.log_tools(_tool_names(generated))
+        if not generated:
+            return "", []
         return content_to_str(generated[-1].content), extract_sources(generated)
     except GraphRecursionError:
         logger.warning("Tool-round cap hit; forcing final answer from gathered context")

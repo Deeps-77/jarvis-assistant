@@ -43,6 +43,8 @@ class SQLiteDataLayer(BaseDataLayer):
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._lock = threading.Lock()
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users(
@@ -154,7 +156,7 @@ class SQLiteDataLayer(BaseDataLayer):
         elif isinstance(created, str) and created:
             try:
                 created_at = int(
-                    time.mktime(datetime.fromisoformat(created).timetuple()) * 1000
+                    round(datetime.fromisoformat(created).timestamp() * 1000)
                 )
             except (ValueError, TypeError):
                 created_at = _now_ms()
@@ -251,7 +253,7 @@ class SQLiteDataLayer(BaseDataLayer):
             steps = []
             if include_steps:
                 srows = self._conn.execute(
-                    "SELECT step_json FROM steps WHERE thread_id = ? ORDER BY created_at, id",
+                    "SELECT step_json FROM steps WHERE thread_id = ? ORDER BY created_at, rowid",
                     (thread_id,),
                 ).fetchall()
                 steps = [json.loads(s[0]) for s in srows]
@@ -373,19 +375,19 @@ class SQLiteDataLayer(BaseDataLayer):
             offset = int(pagination.cursor) if pagination.cursor else 0
             with self._lock:
                 rows = self._conn.execute(
-                    f"SELECT id, name, updated_at FROM threads WHERE {where} "
+                    f"SELECT id, name, created_at, updated_at FROM threads WHERE {where} "
                     "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                     (*params, pagination.first + 1, offset),
                 ).fetchall()
             has_next = len(rows) > pagination.first
             rows = rows[: pagination.first]
             items = []
-            for tid, name, updated in rows:
+            for tid, name, created, updated in rows:
                 items.append(
                     {
                         "id": tid,
                         "name": name or "(untitled)",
-                        "createdAt": _iso(updated),
+                        "createdAt": _iso(created),
                         "userId": owner,
                         "userIdentifier": owner,
                         "metadata": {},

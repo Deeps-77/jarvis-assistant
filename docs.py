@@ -14,7 +14,6 @@ from langchain_ollama import OllamaEmbeddings
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_FORMATS = {".pdf", ".docx", ".txt", ".md"}
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 120
 MAX_CHUNKS_PER_DOC = 200
@@ -86,6 +85,7 @@ class DocStore:
             sqlite_vec.load(self._conn)
             self._conn.enable_load_extension(False)
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks USING vec0("
                 f"embedding float[{dim}] distance_metric=cosine, "
@@ -114,6 +114,7 @@ class DocStore:
         logger.warning("Document store disabled after error: %s", reason)
 
     async def ingest(self, owner: str, filename: str, raw: bytes) -> dict:
+        owner = str(owner)
         if not self.enabled:
             return {"status": "error", "message": "document storage is unavailable"}
         try:
@@ -137,6 +138,7 @@ class DocStore:
             return {"status": "error", "message": f"indexing failed: {e}"}
 
     def _existing_hash(self, owner: str, filename: str) -> str | None:
+        owner = str(owner)
         row = self._conn.execute(
             "SELECT sha256 FROM doc_files WHERE owner = ? AND source = ?",
             (owner, filename),
@@ -144,31 +146,41 @@ class DocStore:
         return row[0] if row else None
 
     def _replace_sync(self, owner: str, filename: str, digest: str, pieces: list[str], vectors: list):
-        self._delete_sync(owner, filename)
+        owner = str(owner)
         ts = int(time.time() * 1000)
-        self._conn.execute(
-            "INSERT INTO doc_files(owner, source, sha256, chunks, ts) VALUES (?, ?, ?, ?, ?)",
-            (owner, filename, digest, len(pieces), ts),
-        )
-        rows = [
-            (
-                sqlite_vec.serialize_float32(vec),
-                owner,
-                filename,
-                piece,
-                idx,
-                ts,
+        # Serialize the delete+insert so concurrent processes can't interleave
+        # and create duplicate chunks (BEGIN IMMEDIATE acquires the write lock
+        # immediately; busy_timeout makes it wait instead of raising).
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._delete_sync(owner, filename)
+            self._conn.execute(
+                "INSERT INTO doc_files(owner, source, sha256, chunks, ts) VALUES (?, ?, ?, ?, ?)",
+                (owner, filename, digest, len(pieces), ts),
             )
-            for idx, (piece, vec) in enumerate(zip(pieces, vectors))
-        ]
-        self._conn.executemany(
-            "INSERT INTO doc_chunks(embedding, owner, source, text, chunk_index, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
+            rows = [
+                (
+                    sqlite_vec.serialize_float32(vec),
+                    owner,
+                    filename,
+                    piece,
+                    idx,
+                    ts,
+                )
+                for idx, (piece, vec) in enumerate(zip(pieces, vectors))
+            ]
+            self._conn.executemany(
+                "INSERT INTO doc_chunks(embedding, owner, source, text, chunk_index, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     async def search(self, owner: str, query: str, k: int | None = None) -> list[tuple[str, int, str]]:
+        owner = str(owner)
         if not self.enabled:
             return []
         k = k or self.search_k
@@ -180,6 +192,7 @@ class DocStore:
             return []
 
     def _search_sync(self, owner: str, vec: list[float], k: int) -> list[tuple[str, int, str]]:
+        owner = str(owner)
         cutoff = 1.0 - self.min_similarity
         rows = self._conn.execute(
             "SELECT source, chunk_index, text, distance FROM doc_chunks "
@@ -189,6 +202,7 @@ class DocStore:
         return [(r[0], r[1], r[2]) for r in rows if r[3] <= cutoff]
 
     async def doc_text(self, owner: str, source: str, cap: int = 6000) -> tuple[str, bool]:
+        owner = str(owner)
         if not self.enabled:
             return "", True
         try:
@@ -198,6 +212,7 @@ class DocStore:
             return "", True
 
     def _doc_text_sync(self, owner: str, source: str, cap: int) -> tuple[str, bool]:
+        owner = str(owner)
         rows = self._conn.execute(
             "SELECT text FROM doc_chunks WHERE owner = ? AND source = ? ORDER BY chunk_index",
             (owner, source),
@@ -212,6 +227,7 @@ class DocStore:
         return "\n\n".join(parts), truncated
 
     async def list_docs(self, owner: str) -> list[dict]:
+        owner = str(owner)
         if not self.enabled:
             return []
         try:
@@ -221,6 +237,7 @@ class DocStore:
             return []
 
     def _list_sync(self, owner: str) -> list[dict]:
+        owner = str(owner)
         rows = self._conn.execute(
             "SELECT source, chunks, ts FROM doc_files WHERE owner = ? ORDER BY ts DESC",
             (owner,),
@@ -247,6 +264,7 @@ class DocStore:
             return 0
 
     async def delete(self, owner: str, source: str) -> bool:
+        owner = str(owner)
         if not self.enabled:
             return False
         try:
@@ -256,6 +274,7 @@ class DocStore:
             return False
 
     def _delete_sync(self, owner: str, source: str):
+        owner = str(owner)
         rowids = [
             r[0]
             for r in self._conn.execute(

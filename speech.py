@@ -19,6 +19,7 @@ class SpeechTranscriber:
         self._model = None
         self._loaded = False
         self._load_lock = asyncio.Lock()
+        self._transcribe_lock = asyncio.Lock()
 
     def _load_sync(self):
         from faster_whisper import WhisperModel
@@ -83,16 +84,19 @@ class SpeechTranscriber:
                 return " ".join(s.text.strip() for s in segments).strip(), info
 
             t0 = time.perf_counter()
-            try:
-                text, info = await asyncio.to_thread(_run)
-            except Exception as e:
-                if self.device != "cpu":
-                    logger.warning("Whisper inference failed (%s); retrying on CPU", e)
-                    self._model = await asyncio.to_thread(self._load_cpu_sync)
-                    self.device = "cpu"
+            # serialize inference on the shared model (faster-whisper is not
+            # documented as thread-safe, and concurrent voice notes race here)
+            async with self._transcribe_lock:
+                try:
                     text, info = await asyncio.to_thread(_run)
-                else:
-                    raise
+                except Exception as e:
+                    if self.device != "cpu":
+                        logger.warning("Whisper inference failed (%s); retrying on CPU", e)
+                        self._model = await asyncio.to_thread(self._load_cpu_sync)
+                        self.device = "cpu"
+                        text, info = await asyncio.to_thread(_run)
+                    else:
+                        raise
             audio_s = float(getattr(info, "duration", 0) or 0)
             engine = f"whisper-{self.model_name}:{self.device}"
             botlog.log_transcribe(audio_s, len(text), engine)

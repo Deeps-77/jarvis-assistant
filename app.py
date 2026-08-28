@@ -241,7 +241,7 @@ def _username() -> str:
 def auth_callback(username: str, password: str):
     expected = _password()
     if not expected:
-        print("CHAINLIT_PASSWORD is not set - web access denied (fail-closed).")
+        logger.warning("CHAINLIT_PASSWORD is not set - web access denied (fail-closed).")
         return None
     if username == _username() and password == expected:
         botlog.log_web_login(username)
@@ -333,11 +333,6 @@ async def on_chat_resume(thread: "ThreadDict"):
     history = _rebuild_history_from_steps(thread.get("steps"))
     core.chat_histories[f"thread:{thread_id}"] = history
 
-    await cl.Message(
-        content=f"📂 Resumed **{thread.get('name') or 'conversation'}** "
-        f"({len(history)} messages of context restored). Continue where we left off!"
-    ).send()
-
 
 @cl.on_message
 async def on_message(message: cl.Message):
@@ -408,6 +403,8 @@ if __name__ == "__main__":
 
     host = os.environ.get("CHAINLIT_HOST", "0.0.0.0")
     base_port = int(os.environ.get("CHAINLIT_PORT", "8000"))
+
+    ensure_setup()
 
     tls = _ensure_tls(Path(__file__).parent)
     if not tls:

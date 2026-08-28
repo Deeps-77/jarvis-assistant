@@ -466,7 +466,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         typing_task.cancel()
-        core.save_histories()
+        await asyncio.to_thread(core.save_histories)
 
 
 async def docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -630,7 +630,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         typing_task.cancel()
-        core.save_histories()
+        await asyncio.to_thread(core.save_histories)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
