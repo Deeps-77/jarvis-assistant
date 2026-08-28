@@ -488,6 +488,38 @@ async def docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Your documents:\n{listing}")
 
 
+async def cleardocs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if owner_id is None or user_id != owner_id:
+        botlog.log_denied(_user_name(update), user_id)
+        await update.effective_message.reply_text(
+            "⛔ /cleardocs is restricted to the bot owner."
+        )
+        return
+    botlog.log_command("cleardocs", _user_name(update), user_id)
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.effective_message.reply_text(
+            "⚠️ This wipes ALL indexed documents (web + Telegram) from the search "
+            "index — chunks and metadata only. Your original files in documents/ "
+            "are kept as a backup.\n\nReply `/cleardocs confirm` to proceed."
+        )
+        return
+    if not core.doc_store or not core.doc_store.enabled:
+        await update.effective_message.reply_text("⚠️ Document store is unavailable.")
+        return
+    removed = await core.doc_store.clear_all()
+    if removed:
+        await update.effective_message.reply_text(
+            f"🧹 Wiped the document index: {removed} file(s) of chunks removed. "
+            "I can no longer search or summarize any uploaded document. "
+            "Original files in documents/ are untouched."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "🧹 Document index is already empty — nothing to wipe."
+        )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if owner_id is None or user_id != owner_id:
@@ -692,6 +724,7 @@ def main():
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("docs", docs_command))
+    app.add_handler(CommandHandler("cleardocs", cleardocs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

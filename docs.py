@@ -291,3 +291,32 @@ class DocStore:
         self._delete_sync(owner, source)
         self._conn.commit()
         return existed
+
+    async def clear_all(self) -> int:
+        """Wipe every indexed document for all owners (web + Telegram).
+
+        Deletes only the semantic chunks/metadata in the database. Raw uploaded
+        files on disk are intentionally left in place as a manual backup.
+        """
+        if not self.enabled:
+            return 0
+        try:
+            return await asyncio.to_thread(self._clear_all_sync)
+        except Exception as e:
+            self._disable(f"clear_all failed: {e}")
+            return 0
+
+    def _clear_all_sync(self) -> int:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            removed = self._conn.execute(
+                "SELECT COUNT(*) FROM doc_files"
+            ).fetchone()[0]
+            self._conn.execute("DELETE FROM doc_chunks")
+            self._conn.execute("DELETE FROM doc_files")
+            self._conn.commit()
+            return removed
+        except Exception:
+            self._conn.rollback()
+            raise
+
