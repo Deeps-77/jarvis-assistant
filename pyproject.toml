@@ -9,6 +9,7 @@ dependencies = [
     "chainlit>=2.11.1",
     "ddgs>=9.15.0",
     "faster-whisper>=1.2.1",
+    "ipykernel>=7.3.0",
     "langchain-core>=1.6.0",
     "langchain-ollama>=1.1.0",
     "langgraph>=1.2.11",
