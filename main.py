@@ -176,9 +176,14 @@ def _render_table(tokens: list) -> str | None:
     for r in rows:
         r.extend([""] * (width - len(r)))
     cols = [min(40, max(len(r[c]) for r in rows)) for c in range(width)]
-    lines = [" | ".join(r[c].ljust(cols[c]) for c in range(width)) for r in rows]
+    # Pad first, then HTML-escape: html.escape never touches spaces, so the
+    # alignment survives. Telegram has no table tags, so the grid must live
+    # inside a <pre> block to render in a monospace font.
+    lines = [
+        " | ".join(_esc(r[c].ljust(cols[c])) for c in range(width)) for r in rows
+    ]
     lines.insert(1, "-+-".join("-" * c for c in cols))
-    return "\n".join(lines)
+    return f"<pre>{chr(10).join(lines)}</pre>"
 
 
 def _render_container(name: str, open_tok, inner: list) -> str | None:
