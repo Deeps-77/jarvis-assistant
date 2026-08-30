@@ -374,9 +374,24 @@ async def on_message(message: cl.Message):
 async def _respond_and_send(text: str):
     answer_msg = cl.Message(content="")
     await answer_msg.send()
+    streamed: list[str] = []
+
+    async def on_token(token: str):
+        streamed.append(token)
+        await answer_msg.stream_token(token)
+
+    async def on_retry():
+        # The streamed text belonged to a tool-calling round, not the final
+        # answer — retract it so the real answer starts from a clean slate.
+        streamed.clear()
+        answer_msg.content = ""
+        await answer_msg.update()
+
     t0 = time.perf_counter()
     try:
-        body, sources, failed = await core.respond(session_key(), text, owner=_username())
+        body, sources, failed = await core.respond(
+            session_key(), text, owner=_username(), on_token=on_token, on_retry=on_retry
+        )
     except Exception as e:
         botlog.log_error_note(f"{type(e).__name__}: {str(e)[:200]}")
         await cl.Message(content="⚠️ Something went wrong processing that.").send()
@@ -384,6 +399,8 @@ async def _respond_and_send(text: str):
     if sources:
         links = "\n".join(f"[{i}] {url}" for i, url in enumerate(sources, start=1))
         body = f"{body}\n\n**Sources:**\n{links}"
+    # Reconcile once: streamed text was raw model output; the final content is
+    # post-processed (identity/sanitize) + sources footer + failure gating.
     answer_msg.content = body or "(no content)"
     await answer_msg.update()
     botlog.log_reply(

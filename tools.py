@@ -8,6 +8,8 @@ from ddgs import DDGS
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
 
+from security import sanitize_external
+
 logger = logging.getLogger(__name__)
 
 MAX_SEARCH_RESULTS = 5
@@ -40,7 +42,7 @@ def web_search(query: str) -> str:
     parts = []
     for i, r in enumerate(results, start=1):
         parts.append(f"[{i}] {r.get('title', '')}\n{r.get('body', '')}\nURL: {r.get('href', '')}")
-    return "\n\n".join(parts)
+    return sanitize_external("\n\n".join(parts), "web search results")
 
 
 @tool
@@ -179,7 +181,7 @@ async def search_documents(query: str, config: Annotated[RunnableConfig, Injecte
     if not hits:
         return "No matching passages found in the uploaded documents."
     blocks = [f"[{src} · chunk {idx}]\n{text}" for src, idx, text in hits]
-    return "\n\n".join(blocks)
+    return sanitize_external("\n\n".join(blocks), "uploaded document excerpts")
 
 
 @tool
@@ -210,4 +212,4 @@ async def summarize_document(source: str, config: Annotated[RunnableConfig, Inje
     if not text:
         return f"ERROR: '{source}' not found or empty. Use list_documents for exact names."
     note = "\n\n(NOTE: document was longer than this excerpt.)" if truncated else ""
-    return f"TEXT OF {source}:\n\n{text}{note}"
+    return sanitize_external(f"TEXT OF {source}:\n\n{text}{note}", f"uploaded document '{source}'")

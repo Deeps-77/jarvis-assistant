@@ -11,7 +11,9 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 - 🖼️ **Image understanding** — attach photos/screenshots/charts from Telegram or the web UI; a local vision model (granite3.2-vision) analyzes what's actually visible
 - 🎤 **Voice input** — local faster-whisper transcription (Telegram voice notes, Chainlit mic + audio files)
 - 🧰 **Exact live-fact tools** — current time anywhere on Earth, calendar math, live weather (wttr.in), exchange rates (ECB), crypto prices (CoinGecko) — all keyless public APIs
-- 🧠 **Long-term semantic memory** — past exchanges are embedded and recalled when relevant, isolated per chat (sqlite-vec)
+- 🧠 **Long-term fact memory** — an LLM extractor distills durable facts from each exchange (deduped, capped, embedded via sqlite-vec, recalled per chat); scanner-flagged facts are quarantined and never recalled
+- 🛡️ **Prompt-injection guard** — web results and document chunks are scanned for instruction-like text, malicious spans are redacted, and all external text enters the model wrapped in untrusted-content boundaries
+- ⚡ **Live token streaming** in the web UI — answers appear as they're generated; tool-chatter is retracted so only the final answer stays
 - 📝 **Native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML (headings, lists, code blocks, tables, clickable source links); the web UI renders full Markdown directly
 - 🛡️ **Anti-hallucination guardrails** — per-turn date grounding, output sanity gate, tool-round caps with forced grounding, "say you don't know" instructions
 - 👥 **Allowlist access control** — only people you approve can talk to it; first allowlisted ID is the owner
@@ -39,7 +41,7 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
                             ▼
                        Ollama LLM (local)
 
-            sqlite-vec memory ◄── embedded exchanges, per-chat isolation (shared by both frontends)
+            sqlite-vec memory ◄── extracted facts, per-chat isolation (shared by both frontends)
 ```
 
 Both frontends talk to the same `core.py` brain, so they share memory, documents and tools. Every turn is grounded with the real current date/time, the agent chooses between dedicated tools and web search, answers pass a sanity gate, get rendered natively for each frontend (Telegram HTML or web Markdown), and flow into per-chat vector memory.
@@ -84,9 +86,13 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 | `ALLOWED_TELEGRAM_IDS` | *(empty = open to anyone)* | comma-separated allowlist; **first ID = owner** |
 | `OLLAMA_MODEL` | LFM2.5-2.6B GGUF | any tool-calling chat model in `ollama list` |
 | `EMBED_MODEL` | `nomic-embed-text` | embedding model behind long-term memory |
-| `MEMORY_TOP_K` | `4` | max recalled old exchanges per query |
+| `MEMORY_TOP_K` | `4` | max recalled facts per query |
 | `MEMORY_MIN_SIMILARITY` | `0.55` | cosine floor for recall (empirically tuned) |
 | `MEMORY_MAX_PER_CHAT` | `500` | FIFO eviction cap per chat |
+| `MEMORY_EXTRACT_MODEL` | *(empty = main model)* | model that distills durable facts from each exchange |
+| `MEMORY_MAX_FACTS_PER_TURN` | `10` | cap on facts captured per exchange |
+| `MEMORY_MAX_FACT_CHARS` | `200` | per-fact length cap |
+| `INJECTION_GUARD` | `true` | scan/redact/tag external text (web + docs) and quarantine suspicious auto-memories |
 
 ## 💬 Commands
 
