@@ -1,21 +1,38 @@
-"""CodeBrain: the ReAct agent that drives the code-assistant UI.
+"""CodeBrain: the agent that drives the code-assistant UI.
 
-Mirrors the structure of ``core.py`` (the chat brain) but:
+Phase 2 swaps :func:`langgraph.prebuilt.create_react_agent` for a manual
+ReAct loop so we can pause for an **approval gate** before any write or
+exec tool runs. The architecture is otherwise identical to ``core.py``:
 
-- Reads its LLM through :mod:`llm_provider` (Phase 0) so a single class
-  powers both Ollama and OpenAI.
+- Reads its LLM through :mod:`llm_provider` (Phase 0) so Ollama and
+  OpenAI share the same path.
 - Wires :class:`token_usage.TokenTracker` into the chat model so every
-  LLM call — including tool-calling rounds — counts toward the live
-  usage card in the UI.
-- Carries a per-session chat history under ``chat_histories[session_key]``
-  so follow-up questions can reference earlier tool reads without
-  re-listing the workspace.
-- Streams an ``AsyncIterator[BrainEvent]`` for the UI rather than returning
-  one big string. Events let the UI show tool chips, retract intermediate
-  chatter when the model calls a tool, and surface token usage per turn.
+  LLM call counts toward the live usage card in the UI.
+- Carries a per-session chat history so follow-up questions can refer
+  to earlier tool reads without re-listing the workspace.
+- Streams an ``AsyncIterator[BrainEvent]`` for the UI: ``token`` /
+  ``tool_start`` / ``tool_end`` / ``approval_required`` / ``usage`` /
+  ``done`` / ``error``.
 
-Phase 1 ships read-only tools; Phase 2 will add a ``BrainEvent`` kind
-``approval_required`` and a resume hook for the approval gate.
+Approval flow
+-------------
+When the model emits a tool call whose name is in
+:data:`code_assistant.tools.REQUIRES_APPROVAL`, the brain:
+
+1. Yields ``approval_required`` with the tool name and args.
+2. Awaits :attr:`_approval_event`.
+3. The UI calls :meth:`submit_approval` with one of:
+   - ``ApprovalDecision("approve")`` — run the tool with the proposed args
+   - ``ApprovalDecision("edit", args=...)`` — run the tool with edited args
+   - ``ApprovalDecision("reject", reason=...)`` — inject a USER_REJECTED
+     tool result so the model can adapt
+
+Mode double-check
+-----------------
+On every tool invocation, :func:`code_assistant.tools._require_build_mode`
+refuses to run unless ``set_current_mode("build")`` was called. The brain
+calls ``set_current_mode`` before each run so a stale UI mode never lets
+write tools slip through.
 """
 
 from __future__ import annotations
@@ -24,16 +41,27 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langgraph.errors import GraphRecursionError
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import BaseTool
 
 from code_assistant.modes import Mode, SYSTEM_PROMPTS, filter_tools, workspace_preamble
-from code_assistant.tools import ALL_TOOLS, set_workspace
+from code_assistant.tools import (
+    ALL_TOOLS,
+    REQUIRES_APPROVAL,
+    ModeError,
+    set_current_mode,
+    set_workspace,
+)
 from code_assistant.workspace import Workspace
 from llm_provider import LLMConfig, build_provider
 from token_usage import TokenTracker
@@ -41,7 +69,6 @@ from token_usage import TokenTracker
 logger = logging.getLogger(__name__)
 
 
-# Cap on the ReAct tool-calling rounds. Mirrors core.MAX_TOOL_ROUNDS.
 MAX_TOOL_ROUNDS = 6
 MAX_HISTORY_MESSAGES = 24
 
@@ -53,18 +80,11 @@ FORCE_FINAL_PROMPT = (
 
 
 def _looks_like_tool_call_json(delta: str) -> bool:
-    """True when a streamed content delta is the model serialising a tool
-    call as raw text.
-
-    Smaller local models occasionally emit tool calls in the content channel
-    instead of the structured ``tool_calls`` channel. When that happens the
-    UI would otherwise show raw JSON to the user. We strip those chunks so
-    only the structured tool_start event surfaces in the UI.
-    """
+    """True when streamed content is the model serialising a tool call as
+    raw text instead of using the structured ``tool_calls`` channel."""
     s = (delta or "").lstrip()
     if not s.startswith("{"):
         return False
-    # Cheap structural check — avoid json.loads() per token for speed.
     return ('"name"' in s and ('"arguments"' in s or '"args"' in s)) or s.startswith('{"tool"')
 
 
@@ -72,15 +92,19 @@ def _looks_like_tool_call_json(delta: str) -> bool:
 class BrainEvent:
     """A single update from :meth:`CodeBrain.run` consumed by the UI."""
 
-    type: str  # "token" | "tool_start" | "tool_end" | "usage" | "done" | "error" | "approval_required"
-    data: dict[str, Any]
+    type: str  # token | tool_start | tool_end | approval_required | usage | done | error
+    data: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "data": self.data}
+
+@dataclass(slots=True)
+class ApprovalDecision:
+    decision: str  # "approve" | "edit" | "reject"
+    args: dict[str, Any] | None = None
+    reason: str = ""
 
 
 class CodeBrain:
-    """Per-session ReAct agent bound to one workspace."""
+    """Per-session agent bound to one workspace."""
 
     def __init__(
         self,
@@ -95,11 +119,13 @@ class CodeBrain:
         self._tracker = tracker
         callbacks = [tracker] if tracker else []
         self._provider, self._llm = build_provider(self._config, callbacks=callbacks)
-        self._tools = filter_tools(ALL_TOOLS, self.mode)
-        self._agent = create_react_agent(self._llm, self._tools)
+        self._tools: list[BaseTool] = filter_tools(ALL_TOOLS, self.mode)
+        self._tool_map = {t.name: t for t in ALL_TOOLS}
         self._history: list[BaseMessage] = []
-        # Inject workspace into the tool module so the LangChain tools see it.
+        self._approval_event = asyncio.Event()
+        self._approval_decision: ApprovalDecision | None = None
         set_workspace(self.workspace)
+        set_current_mode(self.mode.value)
 
     # -------------------------------------------------------------- mutators
 
@@ -108,8 +134,7 @@ class CodeBrain:
             return
         self.mode = mode
         self._tools = filter_tools(ALL_TOOLS, self.mode)
-        # Rebuild the ReAct graph with the new toolbelt.
-        self._agent = create_react_agent(self._llm, self._tools)
+        set_current_mode(self.mode.value)
 
     def reset_history(self) -> None:
         self._history.clear()
@@ -117,194 +142,254 @@ class CodeBrain:
     def workspace_root(self) -> str:
         return str(self.workspace.root)
 
+    # ------------------------------------------------------------ approval
+
+    async def submit_approval(self, decision: ApprovalDecision) -> None:
+        """UI hook: resolve the pending approval and resume the brain."""
+        self._approval_decision = decision
+        self._approval_event.set()
+
     # -------------------------------------------------------------- runtime
 
-    def _messages(self, user_text: str) -> list[BaseMessage]:
+    def _messages(self) -> list[BaseMessage]:
         preamble = workspace_preamble(self.workspace_root(), self.mode)
         system = SystemMessage(content=SYSTEM_PROMPTS[self.mode] + preamble)
-        return [system] + list(self._history) + [HumanMessage(content=user_text)]
+        return [system] + list(self._history)
 
     async def run(self, user_text: str) -> AsyncIterator[BrainEvent]:
-        """Drive one user turn end-to-end, streaming events to the caller.
+        """Drive one user turn end-to-end, streaming events to the caller."""
+        self._approval_event.clear()
+        self._approval_decision = None
+        set_workspace(self.workspace)
+        set_current_mode(self.mode.value)
 
-        Yields:
-            - ``token``: model text delta (may be retracted if a tool follows)
-            - ``tool_start``: a tool call is being made
-            - ``tool_end``: a tool call finished (success or error string)
-            - ``usage``: post-turn snapshot of TokenTracker
-            - ``done``: terminal event with the final reply
-            - ``error``: terminal event if the turn failed
-        """
-        messages = self._messages(user_text)
         self._history.append(HumanMessage(content=user_text))
         self._trim_history()
+        messages = self._messages()
 
-        config = {"recursion_limit": MAX_TOOL_ROUNDS * 2 + 4}
         t0 = time.perf_counter()
-        generated: list[BaseMessage] = []
         final_text: str = ""
         try:
-            async for ev in self._run_streaming(messages, config, generated):
-                yield ev
-            # Find the LAST AIMessage — the final model answer. The list may
-            # end on a ToolMessage if the agent loop closed right after a tool
-            # returned without a final synthesis turn.
-            final_text = ""
-            for msg in reversed(generated):
-                if isinstance(msg, AIMessage):
-                    c = msg.content
-                    final_text = c if isinstance(c, str) else " ".join(str(p) for p in c)
-                    if final_text.strip():
-                        break
-        except GraphRecursionError:
-            logger.warning("CodeBrain: tool-round cap hit; forcing final answer")
-            forced = messages + generated + [HumanMessage(content=FORCE_FINAL_PROMPT)]
-            try:
+            for round_num in range(MAX_TOOL_ROUNDS):
+                # ---- model round ----
+                stream_events, ai_message = await self._stream_model_round(messages)
+                for ev in stream_events:
+                    yield ev
+
+                tool_calls = list(getattr(ai_message, "tool_calls", None) or [])
+                # Small-model fallback: parse content-JSON if no structured calls.
+                if not tool_calls:
+                    full_text = "".join(
+                        e.data.get("data", "") for e in stream_events if e.type == "token"
+                    )
+                    if _looks_like_tool_call_json(full_text):
+                        parsed = _safe_json_loads(full_text)
+                        if isinstance(parsed, dict) and "name" in parsed:
+                            tool_calls = [
+                                {
+                                    "id": f"text_{round_num}",
+                                    "name": parsed.get("name"),
+                                    "args": parsed.get("arguments")
+                                    if "arguments" in parsed
+                                    else parsed.get("args", {}),
+                                }
+                            ]
+                            # Replace the AI message with a tool-calling one.
+                            ai_message = AIMessage(content="", tool_calls=tool_calls)
+
+                messages.append(ai_message)
+                self._history.append(AIMessage(
+                    content=ai_message.content if isinstance(ai_message.content, str) else "",
+                    tool_calls=tool_calls,
+                ))
+
+                if not tool_calls:
+                    final_text = ai_message.content if isinstance(ai_message.content, str) else ""
+                    break
+
+                # ---- tool round ----
+                tool_events, tool_messages = await self._execute_tool_calls(tool_calls)
+                for ev in tool_events:
+                    yield ev
+                for tm in tool_messages:
+                    messages.append(tm)
+            else:
+                logger.warning("CodeBrain: tool-round cap hit; forcing final answer")
+                forced = messages + [HumanMessage(content=FORCE_FINAL_PROMPT)]
                 resp = await self._llm.ainvoke(forced)
-                final_text = resp.content if isinstance(resp.content, str) else str(resp.content)
-                yield BrainEvent("token", {"data": final_text})
-            except Exception as e:  # noqa: BLE001
-                yield BrainEvent("error", {"message": str(e)})
-                return
+                final_text = _content_to_str(resp.content)
+
         except Exception as e:  # noqa: BLE001
             logger.exception("CodeBrain.run failed")
-            yield BrainEvent("error", {"message": str(e)})
+            yield BrainEvent(type="error", data={"message": str(e)})
             return
 
-        if not final_text:
+        if not final_text.strip():
             final_text = "(no response)"
 
         self._history.append(AIMessage(content=final_text))
         self._trim_history()
 
         yield BrainEvent(
-            "usage",
-            {"snapshot": self._tracker.snapshot() if self._tracker else {}},
+            type="usage",
+            data={"snapshot": self._tracker.snapshot() if self._tracker else {}},
         )
         yield BrainEvent(
-            "done",
-            {
+            type="done",
+            data={
                 "reply": final_text,
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
                 "mode": self.mode.value,
             },
         )
 
-    # ----------------------------------------------------------- internals
+    # ----------------------------------------------------------- per-round
 
-    async def _run_streaming(
+    async def _stream_model_round(
         self,
         messages: list[BaseMessage],
-        config: dict,
-        generated: list[BaseMessage],
-    ) -> AsyncIterator[BrainEvent]:
-        """Walk the LangGraph event stream and re-emit as BrainEvents.
+    ) -> tuple[list[BrainEvent], AIMessage]:
+        """Stream one model turn.
 
-        Handles two ways models can emit tool calls:
-
-        1. Structured ``tool_calls`` field on the AIMessage (the OpenAI-style
-           happy path). LangChain recognises it; we re-emit as ``tool_start``
-           events and emit a ``retract`` so the UI can clear any streamed
-           chatter from the previous round.
-
-        2. Raw JSON tool call serialised into ``content`` text (what small
-           local models like qwen2.5-coder:3b do — the streamed ``content``
-           chunks are literally characters of ``{"name": ..., "arguments":
-           ...}``). We accumulate, recognise, and translate the same way.
+        Returns:
+            (events_to_yield, final_ai_message) — the caller iterates the
+            events for the UI and appends ``ai_message`` to its history.
         """
-        # Re-inject the workspace on every run because set_workspace is
-        # module-global and other brains (in tests) may have stomped it.
-        set_workspace(self.workspace)
-        content_buf: list[str] = []
-        async for event in self._agent.astream_events(
-            {"messages": messages}, config=config, version="v2"
-        ):
-            kind = event.get("event")
-            data = event.get("data") or {}
-            if kind == "on_chat_model_stream":
-                chunk = data.get("chunk")
-                delta = ""
-                if chunk is not None:
-                    c = getattr(chunk, "content", "")
-                    delta = c if isinstance(c, str) else " ".join(str(p) for p in c)
-                if delta:
-                    content_buf.append(delta)
-                    yield BrainEvent("token", {"data": delta})
-            elif kind == "on_chat_model_end":
-                msg = data.get("output")
-                if msg is not None:
-                    generated.append(msg)
-                    full_content = "".join(content_buf).strip()
-                    content_buf = []
-                    structured_calls = getattr(msg, "tool_calls", None) or []
-                    text_calls = []
-                    if not structured_calls and full_content and _looks_like_tool_call_json(full_content):
-                        try:
-                            parsed = json.loads(full_content)
-                            if isinstance(parsed, dict):
-                                text_calls = [
-                                    {
-                                        "name": parsed.get("name"),
-                                        "args": parsed.get("arguments")
-                                        if "arguments" in parsed
-                                        else parsed.get("args", {}),
-                                    }
-                                ]
-                        except json.JSONDecodeError:
-                            pass
-                    if structured_calls or text_calls:
-                        # Tool-call chatter — retract anything we streamed so
-                        # the UI presents a clean slate for the next round.
-                        yield BrainEvent("retract", {"reason": "tool_call"})
-                        for tc in structured_calls:
-                            yield BrainEvent(
-                                "tool_start",
-                                {
-                                    "name": tc.get("name"),
-                                    "args": tc.get("args", {}),
-                                },
-                            )
-                        for tc in text_calls:
-                            yield BrainEvent(
-                                "tool_start",
-                                {"name": tc.get("name"), "args": tc.get("args") or {}},
-                            )
-            elif kind == "on_tool_end":
-                out = data.get("output")
-                if out is not None:
-                    generated.append(out)
-                    # ToolMessage.content is what the agent will see next.
-                    content = getattr(out, "content", "")
-                    text = content if isinstance(content, str) else " ".join(str(p) for p in content)
-                    yield BrainEvent(
-                        "tool_end",
-                        {
-                            "name": getattr(out, "name", "tool"),
-                            "output": text[:4000],  # cap UI payload
-                        },
+        events: list[BrainEvent] = []
+        final_chunk: AIMessageChunk | None = None
+        text_parts: list[str] = []
+        async for chunk in self._llm.astream(messages):
+            text = _content_to_str(getattr(chunk, "content", "") or "")
+            if text:
+                text_parts.append(text)
+                events.append(BrainEvent(type="token", data={"data": text}))
+            if isinstance(chunk, AIMessageChunk):
+                final_chunk = chunk
+        if final_chunk is None:
+            final_chunk = AIMessageChunk(content="".join(text_parts))
+        return events, final_chunk
+
+    async def _execute_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> tuple[list[BrainEvent], list[ToolMessage]]:
+        """Run each tool, with approval gating where required.
+
+        Returns:
+            (events_to_yield, tool_messages) — the events include
+            ``tool_start``, ``approval_required``, and ``tool_end`` for
+            each call; ``tool_messages`` are the conversation-level
+            ``ToolMessage`` objects to append to the agent's history.
+        """
+        events: list[BrainEvent] = []
+        tool_messages: list[ToolMessage] = []
+
+        for idx, tc in enumerate(tool_calls):
+            name = tc.get("name") or ""
+            args = tc.get("args") or {}
+            call_id = tc.get("id") or f"call_{idx}"
+
+            events.append(BrainEvent(type="tool_start", data={"name": name, "args": args}))
+
+            needs_approval = name in REQUIRES_APPROVAL
+            if needs_approval:
+                self._approval_event.clear()
+                self._approval_decision = None
+                events.append(
+                    BrainEvent(
+                        type="approval_required",
+                        data={"name": name, "args": args, "tool_call_id": call_id},
                     )
-                    partial = []
-            elif kind == "on_tool_end":
-                out = data.get("output")
-                if out is not None:
-                    generated.append(out)
-                    # ToolMessage.content is what the agent will see next.
-                    content = getattr(out, "content", "")
-                    text = content if isinstance(content, str) else " ".join(str(p) for p in content)
-                    yield BrainEvent(
-                        "tool_end",
-                        {
-                            "name": getattr(out, "name", "tool"),
-                            "output": text[:4000],  # cap UI payload
-                        },
+                )
+                await self._approval_event.wait()
+                decision = self._approval_decision or ApprovalDecision(
+                    decision="reject", reason="no decision recorded"
+                )
+                if decision.decision == "reject":
+                    result_text = (
+                        f"USER_REJECTED: the user declined this {name} call"
+                        + (f" ({decision.reason})" if decision.reason else "")
+                        + "."
                     )
+                    events.append(
+                        BrainEvent(
+                            type="tool_end",
+                            data={
+                                "name": name,
+                                "output": result_text,
+                                "rejected": True,
+                                "tool_call_id": call_id,
+                            },
+                        )
+                    )
+                    tool_messages.append(
+                        ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+                    )
+                    continue
+                if decision.decision == "edit" and decision.args is not None:
+                    args = decision.args
+
+            try:
+                tool_obj = self._tool_map.get(name)
+                if tool_obj is None:
+                    result_text = f"ERROR: unknown tool {name!r}"
+                else:
+                    raw = await _invoke_tool(tool_obj, args)
+                    result_text = _content_to_str(raw)
+            except ModeError as e:
+                result_text = f"ERROR: {e}"
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Tool %s failed", name)
+                result_text = f"ERROR: {type(e).__name__}: {e}"
+
+            events.append(
+                BrainEvent(
+                    type="tool_end",
+                    data={
+                        "name": name,
+                        "output": result_text[:4000],
+                        "tool_call_id": call_id,
+                    },
+                )
+            )
+            tool_messages.append(
+                ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+            )
+
+        return events, tool_messages
+
+    # ----------------------------------------------------------- internals
 
     def _trim_history(self) -> None:
         while len(self._history) > MAX_HISTORY_MESSAGES:
             self._history.pop(0)
-        # History must start with a Human turn so the ReAct prompt is well-formed.
         while self._history and not isinstance(self._history[0], HumanMessage):
             self._history.pop(0)
 
 
-__all__ = ["CodeBrain", "BrainEvent", "MAX_TOOL_ROUNDS"]
+# ============================================================ module helpers
+
+
+def _content_to_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(_content_to_str(p) for p in content)
+    return str(content or "")
+
+
+def _safe_json_loads(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return None
+
+
+async def _invoke_tool(tool: BaseTool, args: dict[str, Any]) -> Any:
+    """Run a tool whether it's sync or async."""
+    if hasattr(tool, "ainvoke"):
+        return await tool.ainvoke(args)
+    return tool.invoke(args)
+
+
+__all__ = ["CodeBrain", "BrainEvent", "ApprovalDecision", "MAX_TOOL_ROUNDS"]

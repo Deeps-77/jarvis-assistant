@@ -183,13 +183,14 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ```
 main.py                Telegram adapter: handlers, auth, markdown→HTML pipeline
 app.py                 Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
-code_ui.py             Chainlit code-assistant adapter (Phase 1+; workspace, mode toggle, streaming)
+code_ui.py             Chainlit code-assistant adapter (Phase 1+; workspace, mode toggle, streaming, approval gate)
 core.py                backend-agnostic chat agent brain (shared by all chat frontends)
-code_assistant/        code-assistant brain + tools (Phase 1: read-only Plan mode)
+code_assistant/        code-assistant brain + tools (Phase 2: read + write + approval)
   workspace.py         Workspace model + path validation + saved-workspaces registry
-  tools.py             read-only LangChain @tool functions (list/read/grep/info)
+  tools.py             LangChain @tool functions (read + write + exec; mode-gated)
   modes.py             Plan/Build mode enum + tool gating + system prompts
-  brain.py             CodeBrain ReAct agent that streams BrainEvents to the UI
+  brain.py             CodeBrain manual ReAct loop with approval gate, streams BrainEvents
+  sandbox.py           subprocess sandbox: env strip, timeout, output cap, copy_out
 tools.py               nine chat tools (search + live facts + document RAG)
 llm_provider.py        Ollama + OpenAI provider abstraction (Phase 0)
 token_usage.py         TokenTracker LangChain callback + JSONL persistence (Phase 0)
@@ -200,7 +201,7 @@ botlog.py              logging setup + human-readable event helpers
 watch_logs.py          colored terminal log follower
 ```
 
-## 💻 Code Assistant (Phase 1 — read-only)
+## 💻 Code Assistant (Phase 2 — read + write with approval gate)
 
 A second web UI dedicated to **workspace-oriented code work**. Runs alongside
 the chat UI on a different port (default `:8500` vs. chat's `:8000`), so the
@@ -211,40 +212,89 @@ two never collide and can run at the same time.
 python code_ui.py           # serves http://localhost:8500
 ```
 
-### What's in Phase 1
+### What's in Phase 2
 
-- **Workspace picker** — type an absolute path (or use a previously saved
-  one) to open a project root. The UI remembers the last few workspaces
-  in `code_workspaces.json`.
-- **Read-only tools** — `list_files`, `read_file` (paginated with line
-  numbers), `grep_files` (regex, uses `rg` when available), `get_file_info`.
-  Every call is validated: paths must be relative, traversal (`..`) is
-  refused, and a deny-glob list hides `.git/`, `.venv/`, `node_modules/`,
-  `.jarvis-sandbox/`, build artefacts, etc.
-- **Plan / Build mode toggle** — Plan (read-only) is fully functional;
-  Build exposes the same read-only toolset today and unlocks
-  `write_file` / `edit_file` / `run_command` in Phase 2.
-- **Live token observation** — every LLM call goes through
-  `TokenTracker`; the sidebar shows per-session input/output totals and
-  an estimated USD cost (OpenAI only; Ollama is local → $0). `/usage`
-  prints the last 10 turns.
-- **Streaming events** — the agent streams `BrainEvent`s (token /
-  retract / tool_start / tool_end / usage / done) instead of returning
-  one big string, so the UI can show tool chips, retract intermediate
-  chatter, and update the usage card live.
-- **Cross-provider** — same `LLMConfig` as the chat brain. Ollama by
-  default, OpenAI when `CODE_LLM_PROVIDER=openai` and
-  `CODE_LLM_API_KEY=...`.
+**Read-only tools (always available, no approval needed):**
+
+- `list_files` — recursive listing, optional glob
+- `read_file` — paginated read with line numbers, byte-capped
+- `grep_files` — regex search (uses `rg` when available)
+- `get_file_info` — size, mtime, language guess
+
+**Write/exec tools (BUILD mode only, every call approval-gated):**
+
+- `write_file` — atomic file write with diff preview
+- `edit_file` — targeted find/replace with diff (refuses ambiguous matches)
+- `apply_patch` — apply a unified diff
+- `mkdir` — recursive directory creation
+- `delete_path` — soft-delete to `.jarvis-sandbox/trash/`
+- `run_command` — single shell command in `.jarvis-sandbox/tmp/` (env
+  stripped, hard timeout, output capped)
+- `copy_out` — move a sandbox-produced file into the workspace
+
+### Safety rails (three layers)
+
+1. **Tool gating** — `modes.filter_tools` ensures Plan mode never sees
+   write tools, period. Build mode exposes them but with a separate
+   `REQUIRES_APPROVAL` registry.
+2. **Mode double-check** — every write tool calls `_require_build_mode()`
+   on entry and returns an error string if the brain isn't in BUILD
+   mode. The brain calls `set_current_mode` before each run so a stale
+   UI mode never lets write tools slip through.
+3. **Per-call approval gate** — before any approval-required tool runs,
+   the brain yields an `approval_required` BrainEvent and pauses. The
+   UI shows a confirmation card; the user replies with:
+   - `approve` — run with the proposed args
+   - `edit` — run with edited args (paste a JSON object)
+   - `reject` — decline; the model sees a `USER_REJECTED` tool result
+     and adapts
+   - `reject <reason>` — decline with an explanation for the model
+
+### Sandboxed command execution
+
+`run_command` runs in `<workspace>/.jarvis-sandbox/tmp/` with the
+environment stripped to a small allow-list (`PATH`, `LANG`, `HOME`,
+`TZ`, …). Hard timeout (default 30 s) and a 200 KB per-stream output
+cap are enforced. Files produced by the sandbox are NOT visible in the
+workspace until `copy_out` is called explicitly. The sandbox is a
+discipline tool, **not** a security boundary — local single-user only.
 
 ### Slash commands in the code UI
 
 | Command | Effect |
 |---|---|
 | `/workspace <path>` | Switch to a different folder |
-| `/mode plan` / `/mode build` | Toggle mode (Build = read-only until Phase 2) |
+| `/mode plan` / `/mode build` | Toggle mode (Build = read-only until approval-gated writes flow) |
 | `/usage` | Token usage summary + last 10 turns |
 | `/reset` | Clear this chat's history |
 | `/help` | Show the welcome card again |
+
+### Workspace picker
+
+- Type an absolute path (e.g. `D:\Projects\myrepo`) to open a project
+  root. The UI remembers the last few workspaces in
+  `code_workspaces.json`.
+- Every call is validated: paths must be relative, traversal (`..`) is
+  refused, and a deny-glob list hides `.git/`, `.venv/`,
+  `node_modules/`, `.jarvis-sandbox/`, build artefacts, etc.
+
+### Live token observation
+
+Every LLM call goes through `TokenTracker`; the sidebar shows
+per-session input/output totals and an estimated USD cost (OpenAI only;
+Ollama is local → $0). `/usage` prints the last 10 turns.
+
+### Streaming events
+
+The agent streams `BrainEvent`s (`token` / `tool_start` / `tool_end` /
+`approval_required` / `usage` / `done` / `error`) instead of returning
+one big string, so the UI can show tool chips, retract intermediate
+chatter, and update the usage card live.
+
+### Cross-provider
+
+Same `LLMConfig` as the chat brain. Ollama by default, OpenAI when
+`CODE_LLM_PROVIDER=openai` and `CODE_LLM_API_KEY=...`.
 
 ### Architecture
 
@@ -253,11 +303,12 @@ python code_ui.py           # serves http://localhost:8500
    You ───► │ Chainlit chat (app.py)  │      │ Chainlit code (code_ui) │◄─── You
             │ password auth, files,   │      │ password auth, workspace│
             │ voice, history sidebar  │      │ picker, mode toggle,    │
-            └────────────┬────────────┘      └────────────┬────────────┘
-                         │                                │
-                         ▼                                ▼
+            └────────────┬────────────┘      │ approval cards          │
+                         │                   └────────────┬────────────┘
+                         ▼                                │
                   core.py + tools.py              code_assistant/brain.py
-                  (chat brain, ReAct)            (CodeBrain, ReAct, mode-aware)
+                  (chat brain, ReAct)             (CodeBrain, manual ReAct loop
+                         │                          with approval gate)
                          │                                │
                          └────────────┬───────────────────┘
                                       ▼
@@ -269,8 +320,8 @@ python code_ui.py           # serves http://localhost:8500
 ```
 
 The code assistant brain is fully **additive** — `core.py` / `tools.py` /
-`app.py` / `main.py` are untouched. Phase 0's `llm_provider.py` and
-`token_usage.py` are shared by both brains.
+`app.py` / `main.py` are untouched. Phases 0/1/2 (`llm_provider.py`,
+`token_usage.py`, `code_assistant/`, `code_ui.py`) are all new modules.
 
 ### Recommended models
 
@@ -279,14 +330,15 @@ The code assistant brain is fully **additive** — `core.py` / `tools.py` /
 | Ollama | `qwen2.5-coder:7b-instruct` (or larger) | Strong tool-calling discipline. The 3B variant in `.env.example` works but sometimes drops tool calls on long refactors. |
 | OpenAI | `gpt-4o-mini` | Cheap, reliable tool-calling. Set `CODE_LLM_PROVIDER=openai` + `CODE_LLM_API_KEY`. |
 
-### Known limits (Phase 1)
+### Known limits (Phase 2)
 
-- Build mode is a placeholder until Phase 2 — both modes expose the same
-  read-only tools today.
 - The brain streams tool-call chatter as raw JSON with small local models
   (the model's structured `tool_calls` channel is unreliable below ~7B).
   The UI auto-detects and retracts that text so the user only sees the
   structured tool chip.
+- The sandbox kills the subprocess on timeout, but on Windows the child
+  process tree can linger in the background briefly. Use `delete_path`
+  to clean up sandbox artefacts if needed.
 - The code UI does **not** run alongside Telegram's `/mode` command — the
   mode toggle is web-UI-only, per the original design.
 

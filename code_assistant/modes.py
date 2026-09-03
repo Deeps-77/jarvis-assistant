@@ -6,18 +6,21 @@ Two modes drive every assistant turn:
   cannot create, edit, delete, or execute anything. The user reviews the
   proposed plan in the UI before flipping to Build.
 
-- :attr:`Mode.BUILD` — full toolset. Phase 2 adds the write/exec tools behind
-  a per-call approval gate; Phase 1 only exposes the read-only tools even in
-  Build, so the toggle is purely a UX-level marker until the write tools ship.
+- :attr:`Mode.BUILD` — full toolset (Phase 2+). Exposes the read-only tools
+  plus the write/exec toolset, every mutating call guarded by an approval
+  gate in the UI.
 
-The mode is the **single source of truth** for tool availability. Two layers
-enforce it:
+The mode is the **single source of truth** for tool availability. Three
+layers enforce it:
 
 1. :func:`filter_tools` selects which tools the agent's ReAct graph sees.
-2. Each write tool (Phase 2) double-checks ``current_mode`` at call time and
-   raises :class:`PermissionError` if invoked under the wrong mode. The
-   LangChain ReAct loop catches the error and feeds it back into the
-   conversation so the model self-corrects.
+2. Each write tool calls :func:`code_assistant.tools._require_build_mode`
+   on entry and raises :class:`code_assistant.tools.ModeError` if the
+   brain isn't in BUILD mode. The LangChain ReAct loop catches the error
+   and feeds it back into the conversation so the model self-corrects.
+3. The brain's event stream pauses on every tool whose name is in
+   :data:`code_assistant.tools.REQUIRES_APPROVAL` and yields an
+   ``approval_required`` event for the UI to confirm.
 """
 
 from __future__ import annotations
@@ -46,9 +49,24 @@ class Mode(str, Enum):
 PLAN_TOOL_NAMES: frozenset[str] = frozenset(
     {"list_files", "read_file", "grep_files", "get_file_info"}
 )
-# Phase 2 will add: write_file, edit_file, apply_patch, mkdir, delete_path,
-# run_command, copy_out. For now BUILD is a superset of PLAN plus a marker.
-BUILD_TOOL_NAMES: frozenset[str] = PLAN_TOOL_NAMES  # grows in Phase 2
+# BUILD includes everything — read-only tools PLUS the write/exec toolset.
+# Write tools are individually gated by ``_require_build_mode`` AND the
+# approval flow.
+BUILD_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_files",
+        "read_file",
+        "grep_files",
+        "get_file_info",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "mkdir",
+        "delete_path",
+        "run_command",
+        "copy_out",
+    }
+)
 
 TOOLSETS: dict[Mode, frozenset[str]] = {
     Mode.PLAN: PLAN_TOOL_NAMES,
@@ -101,15 +119,31 @@ to Build mode:
 
 BUILD_PROMPT_SUFFIX = """
 
-CURRENT MODE: BUILD (full toolset)
+CURRENT MODE: BUILD (full toolset with approval gate)
 
-You have access to the same read tools as Plan mode (list_files, read_file,
-grep_files, get_file_info). Phase 2 will add write_file, edit_file, and
-run_command behind a per-call approval gate in the UI — until then, behave as
-if you were in Plan mode even though the toggle is set to Build.
+Read tools (always available, no approval needed):
+- list_files, read_file, grep_files, get_file_info
 
-When the write tools arrive: do NOT apply changes silently. Surface the diff
-you intend to make, wait for the user to approve, and adapt if they reject.
+Write/exec tools (every call is approval-gated in the UI before it runs):
+- write_file: create or replace a file (atomic via temp+rename)
+- edit_file: targeted find/replace (refuses ambiguous matches)
+- apply_patch: apply a unified diff
+- mkdir: recursive directory creation
+- delete_path: soft-delete to .jarvis-sandbox/trash
+- run_command: single shell command in .jarvis-sandbox/tmp/ (env stripped,
+  hard timeout, output capped)
+- copy_out: move a sandbox-produced file into the workspace
+
+Rules for using write/exec tools:
+1. Always inspect the file first with read_file or grep_files before editing.
+2. Prefer edit_file over write_file when the change is small and local.
+3. run_command does NOT support shell metacharacters (|, >, ;, &&). Pass one
+   executable invocation per call. For multi-step workflows, call run_command
+   multiple times.
+4. Files produced by run_command live in .jarvis-sandbox/tmp/. To make them
+   visible in the workspace, call copy_out.
+5. Never claim a write succeeded unless the tool returned "APPLIED: <path>".
+   A USER_REJECTED response means the user declined — adapt the plan or ask.
 """
 
 
@@ -137,6 +171,8 @@ def workspace_preamble(workspace_root: str, mode: Mode) -> str:
 __all__ = [
     "Mode",
     "TOOLSETS",
+    "PLAN_TOOL_NAMES",
+    "BUILD_TOOL_NAMES",
     "SYSTEM_PROMPTS",
     "filter_tools",
     "workspace_preamble",
