@@ -20,6 +20,7 @@ documents/
 .chainlit/
 .files/
 .chainlit.secret
-session-ses_*.md
+.code_ui.secret
+code_workspaces.json
 certs/
 chat_threads.db*

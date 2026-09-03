@@ -181,16 +181,114 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ## 📁 Project layout
 
 ```
-main.py          Telegram adapter: handlers, auth, markdown→HTML pipeline
-app.py           Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
-core.py          backend-agnostic agent brain (shared by all frontends)
-tools.py         nine agent tools (search + live facts + document RAG)
-docs.py          per-user document store (parse, chunk, embed, retrieve)
-memory.py        sqlite-vec long-term conversational memory
-speech.py        whisper-based speech transcription
-botlog.py        logging setup + human-readable event helpers
-watch_logs.py    colored terminal log follower
+main.py                Telegram adapter: handlers, auth, markdown→HTML pipeline
+app.py                 Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
+code_ui.py             Chainlit code-assistant adapter (Phase 1+; workspace, mode toggle, streaming)
+core.py                backend-agnostic chat agent brain (shared by all chat frontends)
+code_assistant/        code-assistant brain + tools (Phase 1: read-only Plan mode)
+  workspace.py         Workspace model + path validation + saved-workspaces registry
+  tools.py             read-only LangChain @tool functions (list/read/grep/info)
+  modes.py             Plan/Build mode enum + tool gating + system prompts
+  brain.py             CodeBrain ReAct agent that streams BrainEvents to the UI
+tools.py               nine chat tools (search + live facts + document RAG)
+llm_provider.py        Ollama + OpenAI provider abstraction (Phase 0)
+token_usage.py         TokenTracker LangChain callback + JSONL persistence (Phase 0)
+docs.py                per-user document store (parse, chunk, embed, retrieve)
+memory.py              sqlite-vec long-term conversational memory
+speech.py              whisper-based speech transcription
+botlog.py              logging setup + human-readable event helpers
+watch_logs.py          colored terminal log follower
 ```
+
+## 💻 Code Assistant (Phase 1 — read-only)
+
+A second web UI dedicated to **workspace-oriented code work**. Runs alongside
+the chat UI on a different port (default `:8500` vs. chat's `:8000`), so the
+two never collide and can run at the same time.
+
+```bash
+# .env → set CHAINLIT_CODE_PASSWORD (the UI is fail-closed without it)
+python code_ui.py           # serves http://localhost:8500
+```
+
+### What's in Phase 1
+
+- **Workspace picker** — type an absolute path (or use a previously saved
+  one) to open a project root. The UI remembers the last few workspaces
+  in `code_workspaces.json`.
+- **Read-only tools** — `list_files`, `read_file` (paginated with line
+  numbers), `grep_files` (regex, uses `rg` when available), `get_file_info`.
+  Every call is validated: paths must be relative, traversal (`..`) is
+  refused, and a deny-glob list hides `.git/`, `.venv/`, `node_modules/`,
+  `.jarvis-sandbox/`, build artefacts, etc.
+- **Plan / Build mode toggle** — Plan (read-only) is fully functional;
+  Build exposes the same read-only toolset today and unlocks
+  `write_file` / `edit_file` / `run_command` in Phase 2.
+- **Live token observation** — every LLM call goes through
+  `TokenTracker`; the sidebar shows per-session input/output totals and
+  an estimated USD cost (OpenAI only; Ollama is local → $0). `/usage`
+  prints the last 10 turns.
+- **Streaming events** — the agent streams `BrainEvent`s (token /
+  retract / tool_start / tool_end / usage / done) instead of returning
+  one big string, so the UI can show tool chips, retract intermediate
+  chatter, and update the usage card live.
+- **Cross-provider** — same `LLMConfig` as the chat brain. Ollama by
+  default, OpenAI when `CODE_LLM_PROVIDER=openai` and
+  `CODE_LLM_API_KEY=...`.
+
+### Slash commands in the code UI
+
+| Command | Effect |
+|---|---|
+| `/workspace <path>` | Switch to a different folder |
+| `/mode plan` / `/mode build` | Toggle mode (Build = read-only until Phase 2) |
+| `/usage` | Token usage summary + last 10 turns |
+| `/reset` | Clear this chat's history |
+| `/help` | Show the welcome card again |
+
+### Architecture
+
+```
+            ┌─────────────────────────┐      ┌─────────────────────────┐
+   You ───► │ Chainlit chat (app.py)  │      │ Chainlit code (code_ui) │◄─── You
+            │ password auth, files,   │      │ password auth, workspace│
+            │ voice, history sidebar  │      │ picker, mode toggle,    │
+            └────────────┬────────────┘      └────────────┬────────────┘
+                         │                                │
+                         ▼                                ▼
+                  core.py + tools.py              code_assistant/brain.py
+                  (chat brain, ReAct)            (CodeBrain, ReAct, mode-aware)
+                         │                                │
+                         └────────────┬───────────────────┘
+                                      ▼
+                          llm_provider.py  ◄── Ollama OR OpenAI
+                                      │
+                          token_usage.TokenTracker  ◄── callbacks into both brains
+                                      │
+                          logs/code_tokens.jsonl  (per-turn usage log)
+```
+
+The code assistant brain is fully **additive** — `core.py` / `tools.py` /
+`app.py` / `main.py` are untouched. Phase 0's `llm_provider.py` and
+`token_usage.py` are shared by both brains.
+
+### Recommended models
+
+| Provider | Recommended | Notes |
+|---|---|---|
+| Ollama | `qwen2.5-coder:7b-instruct` (or larger) | Strong tool-calling discipline. The 3B variant in `.env.example` works but sometimes drops tool calls on long refactors. |
+| OpenAI | `gpt-4o-mini` | Cheap, reliable tool-calling. Set `CODE_LLM_PROVIDER=openai` + `CODE_LLM_API_KEY`. |
+
+### Known limits (Phase 1)
+
+- Build mode is a placeholder until Phase 2 — both modes expose the same
+  read-only tools today.
+- The brain streams tool-call chatter as raw JSON with small local models
+  (the model's structured `tool_calls` channel is unreliable below ~7B).
+  The UI auto-detects and retracts that text so the user only sees the
+  structured tool chip.
+- The code UI does **not** run alongside Telegram's `/mode` command — the
+  mode toggle is web-UI-only, per the original design.
 
 ## 🧪 Known limits
 
