@@ -88,6 +88,10 @@ class LLMConfig:
     timeout: int = 600
     keep_alive: str = "-1"
     max_tokens: int = 0  # 0 = provider default
+    # Capability flags (auto-detected or manually set via config/env)
+    supports_vision: bool = False
+    supports_structured_output: bool = False
+    supports_function_calling: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -219,6 +223,17 @@ class OllamaProvider(LLMProvider):
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self._detect_capabilities()
+
+    def _detect_capabilities(self) -> None:
+        """Auto-detect capabilities based on model name."""
+        model = self.config.model.lower()
+        # Vision models often have "vision" in name or are known vision models
+        vision_keywords = ["vision", "llava", "bakllava", "moondream", "granite3.2-vision"]
+        self.config.supports_vision = any(kw in model for kw in vision_keywords)
+        # Structured output: most modern Ollama models support it via function calling
+        self.config.supports_structured_output = True
+        self.config.supports_function_calling = True
 
     @staticmethod
     def _normalize_keep_alive(raw: str) -> int | str:
@@ -273,6 +288,21 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self._detect_capabilities()
+
+    def _detect_capabilities(self) -> None:
+        """Auto-detect capabilities based on model name."""
+        model = self.config.model.lower()
+        # Vision: gpt-4o, gpt-4o-mini, gpt-4-vision, gpt-4-turbo
+        vision_models = [
+            "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision",
+            "o4-mini", "o3-mini", "o1-mini"
+        ]
+        self.config.supports_vision = any(vm in model for vm in vision_models)
+        # Structured outputs: gpt-4o-2024-08-06+, gpt-4o-mini, o1, o3, o4 series
+        structured_models = ["gpt-4o", "gpt-4.1", "o1", "o3", "o4"]
+        self.config.supports_structured_output = any(sm in model for sm in structured_models)
+        self.config.supports_function_calling = True
 
     def get_chat_model(self, callbacks: list[BaseCallbackHandler] | None = None) -> BaseChatModel:
         from langchain_openai import ChatOpenAI

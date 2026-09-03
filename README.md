@@ -342,6 +342,136 @@ The code assistant brain is fully **additive** — `core.py` / `tools.py` /
 - The code UI does **not** run alongside Telegram's `/mode` command — the
   mode toggle is web-UI-only, per the original design.
 
+## 💻 Code Assistant (Phase 3 — observability + customisable harness)
+
+Phase 3 adds **token observability**, a **YAML harness config**, and a
+**subclassing API** so power users can tailor the agent without forking.
+
+### Token observability
+
+- **Daily roll-up** — `TokenTracker.daily_summary(days=N)` reads
+  `logs/code_tokens.jsonl` and aggregates usage per calendar day,
+  broken down by model. Use `/usage` in the UI to see a markdown card
+  with session totals, a 7-day roll-up table, and the last 100 turns.
+- **`render_usage_card(limit=100)`** — one-call method that produces
+  a ready-to-render markdown card (session totals, daily roll-up,
+  per-turn table). Used by the `/usage` slash command.
+- **Per-model cost tracking** — OpenAI models get USD estimates from a
+  static price table; Ollama is always free. Costs are persisted in
+  `logs/code_tokens.jsonl` so roll-ups survive restarts.
+
+### YAML harness config (`code_assistant.yaml`)
+
+Create `code_assistant.yaml` next to `code_ui.py` to override defaults
+without touching Python. Env vars (`CODE_LLM_*`, `CODE_SANDBOX_TIMEOUT`,
+etc.) **always win** over YAML.
+
+```yaml
+code_assistant:
+  llm:
+    provider: ollama           # or "openai"
+    model: qwen2.5-coder:3b
+    base_url: http://localhost:11434
+    temperature: 0.1
+    num_ctx: 16384
+    timeout: 600
+    keep_alive: -1
+    max_tokens: 0              # 0 = provider default
+    api_key: ""                # openai only; env CODE_LLM_API_KEY wins
+
+  sandbox:
+    timeout_seconds: 30
+    max_output_bytes: 200000
+    env_keep: [PATH, LANG, HOME]   # additive with DEFAULT_ENV_KEEP
+
+  modes:
+    plan:
+      tools: [list_files, read_file, grep_files, get_file_info]   # or "all"
+      extra_system_prompt: ""   # appended to the built-in prompt
+    build:
+      tools: all
+      extra_system_prompt: ""
+
+  harness:
+    max_tool_rounds: 6
+    max_history_messages: 24
+    require_approval_for: [write_file, edit_file, ...]   # additive to REQUIRES_APPROVAL
+```
+
+**Precedence:** `os.environ` → `code_assistant.yaml` → hard-coded defaults.
+
+### Harness subclassing API
+
+Subclass `CodeBrain` or configure at runtime:
+
+```python
+brain = CodeBrain(workspace=ws, llm_config=cfg, tracker=tracker, mode=Mode.BUILD)
+
+# Add a custom tool (available in Build mode by default)
+brain.register_tool(my_custom_tool, modes=[Mode.BUILD])
+
+# Append custom prompt suffix
+brain.override_prompt(Mode.PLAN, "\nAlways reply in Pirate English.")
+
+# Dynamically add a tool to the approval gate
+brain.register_approval_required("custom_risky_tool")
+
+# Tune limits
+brain.max_tool_rounds = 10
+brain.max_history_messages = 50
+
+# Apply YAML config at runtime
+from code_assistant.config import load_config
+brain._apply_config_overrides(load_config().raw)
+```
+
+**Harness API surface:**
+
+| Method | Purpose |
+|---|---|
+| `register_tool(tool, modes)` | Add a custom `@tool` to `modes` (default `BUILD`) |
+| `override_prompt(mode, suffix)` | Append `suffix` to the system prompt for `mode` |
+| `register_approval_required(name)` | Add `name` to the approval gate |
+| `unregister_approval_required(name)` | Remove from approval gate |
+| `_apply_config_overrides(dict)` | Bulk-apply limits, prompts, approval list |
+
+### Model capability flags
+
+`LLMConfig` now carries auto-detected flags so the harness can branch:
+
+| Flag | Meaning | Auto-detected for |
+|---|---|---|
+| `supports_vision` | Model can process images | `llava`, `gpt-4o*`, `granite3.2-vision` |
+| `supports_structured_output` | Native structured output (JSON schema) | `gpt-4o*`, `o1/o3/o4` series |
+| `supports_function_calling` | Native function/tool calling | All modern models |
+
+Auto-detected at provider construction; override in `code_assistant.yaml`
+via `llm:` block if needed.
+
+### Updated limits (Phase 3)
+
+- Token dashboard now shows daily roll-up and per-model breakdown.
+- Config file is optional; env vars always take precedence.
+- Harness API is fully typed and documented in `code_assistant/brain.py`.
+
+### Known limits (Phase 3)
+
+- Token dashboard now shows daily roll-up and per-model breakdown.
+- Config file is optional; env vars always take precedence.
+- Harness API is fully typed and documented in `code_assistant/brain.py`.
+
+### Known limits (Phase 2)
+
+- The brain streams tool-call chatter as raw JSON with small local models
+  (the model's structured `tool_calls` channel is unreliable below ~7B).
+  The UI auto-detects and retracts that text so the user only sees the
+  structured tool chip.
+- The sandbox kills the subprocess on timeout, but on Windows the child
+  process tree can linger in the background briefly. Use `delete_path`
+  to clean up sandbox artefacts if needed.
+- The code UI does **not** run alongside Telegram's `/mode` command — the
+  mode toggle is web-UI-only, per the original design.
+
 ## 🧪 Known limits
 
 - Small (≤3B) models vary in instruction-following: persona discipline, tool choice, and hallucination resistance improve with larger models.

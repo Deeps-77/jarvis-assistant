@@ -352,28 +352,8 @@ async def _cmd_usage() -> None:
     if not tracker:
         await cl.Message(content="No active session.").send()
         return
-    snap = tracker.snapshot()
-    history = tracker.history(10)
-    history_block = ""
-    if history:
-        rows = "\n".join(
-            f"- `{time.strftime('%H:%M:%S', time.localtime(h['ts']))}` "
-            f"in {h['input_tokens']} / out {h['output_tokens']} "
-            f"({int(h.get('duration_ms', 0))}ms)"
-            for h in history
-        )
-        history_block = f"\n\n**Last {len(history)} turns**\n{rows}"
-    await cl.Message(
-        content=(
-            f"**Token usage**\n"
-            f"- Turns: **{snap['turns']}**\n"
-            f"- Input: **{snap['input_tokens']:,}**\n"
-            f"- Output: **{snap['output_tokens']:,}**\n"
-            f"- Total: **{snap['total_tokens']:,}**\n"
-            f"- Est. cost: **${snap['cost_usd']:.4f}**"
-            f"{history_block}"
-        )
-    ).send()
+    card = tracker.render_usage_card(history_limit=100)
+    await cl.Message(content=card).send()
 
 
 async def _cmd_reset() -> None:

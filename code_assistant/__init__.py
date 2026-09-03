@@ -10,7 +10,10 @@ Layers:
     code_assistant.tools        Read-only LangChain @tool functions
     code_assistant.modes        Plan/Build mode enum + tool gating
     code_assistant.brain        CodeBrain: ReAct agent that streams events
+    code_assistant.config       YAML harness config + overrides
     code_ui.py                  Chainlit frontend on port 8500 (Phase 1+)
 """
 
-__all__ = ["workspace", "tools", "modes", "brain"]
+from code_assistant.brain import ApprovalDecision
+
+__all__ = ["workspace", "tools", "modes", "brain", "config", "ApprovalDecision"]

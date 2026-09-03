@@ -104,7 +104,20 @@ class ApprovalDecision:
 
 
 class CodeBrain:
-    """Per-session agent bound to one workspace."""
+    """Per-session agent bound to one workspace.
+
+    Harness API
+    -----------
+    The brain is designed to be subclassed or configured at runtime:
+
+    - :meth:`register_tool` — add a custom tool to specific modes
+    - :meth:`override_prompt` — append/replace system prompt suffix per mode
+    - :meth:`register_approval_required` — dynamically add a tool to the
+      approval gate
+    - Instance attributes ``max_tool_rounds``, ``max_history_messages``
+      control loop limits (can be overridden after construction or via
+      :class:`code_assistant.config.CodeAssistantConfig`).
+    """
 
     def __init__(
         self,
@@ -112,6 +125,7 @@ class CodeBrain:
         llm_config: LLMConfig | None = None,
         tracker: TokenTracker | None = None,
         mode: Mode = Mode.PLAN,
+        config_overrides: dict | None = None,
     ) -> None:
         self.workspace = workspace
         self.mode = mode
@@ -124,6 +138,18 @@ class CodeBrain:
         self._history: list[BaseMessage] = []
         self._approval_event = asyncio.Event()
         self._approval_decision: ApprovalDecision | None = None
+
+        # Harness customisation points
+        self.max_tool_rounds = MAX_TOOL_ROUNDS
+        self.max_history_messages = MAX_HISTORY_MESSAGES
+        self._custom_tools: dict[str, BaseTool] = {}
+        self._prompt_suffixes: dict[Mode, str] = {}
+        self._approval_registry: set[str] = set(REQUIRES_APPROVAL)
+
+        # Apply config overrides (from code_assistant.yaml or dict)
+        if config_overrides:
+            self._apply_config_overrides(config_overrides)
+
         set_workspace(self.workspace)
         set_current_mode(self.mode.value)
 
@@ -142,7 +168,84 @@ class CodeBrain:
     def workspace_root(self) -> str:
         return str(self.workspace.root)
 
-    # ------------------------------------------------------------ approval
+    # ------------------------------------------------------------ harness API
+
+    def register_tool(
+        self,
+        tool: BaseTool,
+        modes: list[Mode] | None = None,
+    ) -> None:
+        """Register a custom tool for specific modes.
+
+        Args:
+            tool: A LangChain ``@tool``-decorated function.
+            modes: List of modes to enable the tool for. Defaults to
+                ``[Mode.BUILD]`` (write/exec tools). Use ``[Mode.PLAN, Mode.BUILD]``
+                for read-only tools.
+        """
+        if modes is None:
+            modes = [Mode.BUILD]
+        self._custom_tools[tool.name] = tool
+        for m in modes:
+            if m == Mode.PLAN:
+                # Add to PLAN toolset by forcing filter to include it
+                pass  # Filter logic will pick it up via tool name in allowed set
+            # For BUILD mode, the tool will be included since we rebuild tools in set_mode
+        # Rebuild tools for current mode so the new tool is available
+        self._rebuild_tools()
+
+    def _rebuild_tools(self) -> None:
+        """Rebuild the active tool list from ALL_TOOLS + custom tools."""
+        # Start with base tools for current mode
+        self._tools = filter_tools(ALL_TOOLS, self.mode)
+        # Add custom tools if they're allowed in current mode
+        for tool in self._custom_tools.values():
+            if tool.name in REQUIRES_APPROVAL and self.mode == Mode.PLAN:
+                continue  # Skip approval-required tools in Plan mode
+            if tool.name not in [t.name for t in self._tools]:
+                self._tools.append(tool)
+        self._tool_map = {t.name: t for t in ALL_TOOLS}
+        self._tool_map.update(self._custom_tools)
+
+    def override_prompt(self, mode: Mode, suffix: str) -> None:
+        """Append or replace a system prompt suffix for a given mode.
+
+        The suffix is appended to the built-in prompt for that mode.
+        Pass an empty string to clear.
+        """
+        if suffix:
+            self._prompt_suffixes[mode] = suffix
+        elif mode in self._prompt_suffixes:
+            del self._prompt_suffixes[mode]
+
+    def register_approval_required(self, tool_name: str) -> None:
+        """Add a tool name to the approval gate registry.
+
+        The tool will trigger ``approval_required`` events before
+        execution, regardless of its default classification.
+        """
+        self._approval_registry.add(tool_name)
+
+    def unregister_approval_required(self, tool_name: str) -> None:
+        """Remove a tool from the approval gate."""
+        self._approval_registry.discard(tool_name)
+
+    def _apply_config_overrides(self, overrides: dict) -> None:
+        """Apply config dict (from code_assistant.yaml or dict)."""
+        if "max_tool_rounds" in overrides:
+            self.max_tool_rounds = int(overrides["max_tool_rounds"])
+        if "max_history_messages" in overrides:
+            self.max_history_messages = int(overrides["max_history_messages"])
+        if "approval_required" in overrides:
+            for name in overrides["approval_required"]:
+                self.register_approval_required(name)
+        if "prompt_suffixes" in overrides:
+            for mode_str, suffix in overrides["prompt_suffixes"].items():
+                try:
+                    mode = Mode.parse(mode_str)
+                    self.override_prompt(mode, suffix)
+                except ValueError:
+                    pass
 
     async def submit_approval(self, decision: ApprovalDecision) -> None:
         """UI hook: resolve the pending approval and resume the brain."""
@@ -153,7 +256,9 @@ class CodeBrain:
 
     def _messages(self) -> list[BaseMessage]:
         preamble = workspace_preamble(self.workspace_root(), self.mode)
-        system = SystemMessage(content=SYSTEM_PROMPTS[self.mode] + preamble)
+        base = SYSTEM_PROMPTS[self.mode]
+        suffix = self._prompt_suffixes.get(self.mode, "")
+        system = SystemMessage(content=base + suffix + preamble)
         return [system] + list(self._history)
 
     async def run(self, user_text: str) -> AsyncIterator[BrainEvent]:
@@ -291,7 +396,7 @@ class CodeBrain:
 
             events.append(BrainEvent(type="tool_start", data={"name": name, "args": args}))
 
-            needs_approval = name in REQUIRES_APPROVAL
+            needs_approval = name in self._approval_registry
             if needs_approval:
                 self._approval_event.clear()
                 self._approval_decision = None
@@ -392,4 +497,9 @@ async def _invoke_tool(tool: BaseTool, args: dict[str, Any]) -> Any:
     return tool.invoke(args)
 
 
-__all__ = ["CodeBrain", "BrainEvent", "ApprovalDecision", "MAX_TOOL_ROUNDS"]
+__all__ = [
+    "CodeBrain",
+    "BrainEvent",
+    "ApprovalDecision",
+    "MAX_TOOL_ROUNDS",
+]

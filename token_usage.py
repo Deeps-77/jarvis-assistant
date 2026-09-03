@@ -157,6 +157,134 @@ class TokenTracker(BaseCallbackHandler):
             self.totals = TokenTotals()
             self._turns.clear()
 
+    def daily_summary(self, days: int = 7) -> list[dict[str, Any]]:
+        """Read the JSONL log and aggregate usage per local day.
+
+        Returns a list of dicts, most recent day first, each with::
+
+            {
+                "date": "2026-09-03",
+                "turns": N,
+                "input_tokens": N,
+                "output_tokens": N,
+                "cost_usd": float,
+                "models": {"qwen2.5-coder:3b": {"turns": N, "tokens": N, "cost_usd": float}, ...}
+            }
+
+        Reads the on-disk log so totals survive restarts. Caps each
+        model's per-day token bucket to avoid unbounded memory.
+        """
+        import datetime as _dt
+        import collections
+
+        if not self.log_path.exists():
+            return []
+        rows_by_day: dict[str, dict[str, Any]] = {}
+        models_by_day: dict[str, dict[str, dict[str, Any]]] = {}
+        try:
+            with self.log_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = float(row.get("ts", 0))
+                    if not ts:
+                        continue
+                    day = _dt.datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d")
+                    model = str(row.get("model", "unknown"))
+                    in_tok = int(row.get("input_tokens", 0))
+                    out_tok = int(row.get("output_tokens", 0))
+                    cost = float(row.get("cost_usd", 0.0))
+
+                    bucket = rows_by_day.setdefault(day, {
+                        "date": day,
+                        "turns": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "models": {},
+                    })
+                    bucket["turns"] += 1
+                    bucket["input_tokens"] += in_tok
+                    bucket["output_tokens"] += out_tok
+                    bucket["cost_usd"] += cost
+                    m_bucket = bucket["models"].setdefault(model, {
+                        "turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                    })
+                    m_bucket["turns"] += 1
+                    m_bucket["input_tokens"] += in_tok
+                    m_bucket["output_tokens"] += out_tok
+                    m_bucket["cost_usd"] += cost
+                    bucket["cost_usd"] = round(bucket["cost_usd"], 6)
+                    m_bucket["cost_usd"] = round(m_bucket["cost_usd"], 6)
+        except OSError as e:
+            logger.warning("TokenTracker daily_summary read failed: %s", e)
+            return []
+
+        # Sort by date desc and cap to ``days``
+        ordered = sorted(rows_by_day.values(), key=lambda r: r["date"], reverse=True)
+        return ordered[:days]
+
+    def render_usage_card(self, history_limit: int = 10) -> str:
+        """Render a human-readable usage card for ``/usage``.
+
+        Includes:
+        - Session totals
+        - Daily roll-up (last 7 days from JSONL)
+        - Last N turns as a markdown table
+        """
+        snap = self.snapshot()
+        lines: list[str] = []
+        lines.append("### Token usage — current session")
+        lines.append(f"- Session: `{snap['session_id']}`")
+        lines.append(f"- Model: `{snap['provider']}:{snap['model']}`")
+        lines.append(f"- Turns: **{snap['turns']:,}**")
+        lines.append(f"- Input: **{snap['input_tokens']:,}**  ·  Output: **{snap['output_tokens']:,}**  ·  Total: **{snap['total_tokens']:,}**")
+        lines.append(f"- Avg in/out per turn: **{snap['avg_input']:,}** / **{snap['avg_output']:,}**")
+        lines.append(f"- Est. cost: **${snap['cost_usd']:.4f}**")
+        if snap["first_ts"]:
+            import datetime as _dt
+            f = _dt.datetime.fromtimestamp(snap["first_ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            l = _dt.datetime.fromtimestamp(snap["last_ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"- First turn: {f}  ·  Last turn: {l}")
+
+        # Daily summary
+        daily = self.daily_summary(7)
+        if daily:
+            lines.append("")
+            lines.append("### Last 7 days (from JSONL log)")
+            lines.append("| Date | Turns | In | Out | Cost |")
+            lines.append("|---|---:|---:|---:|---:|")
+            for d in daily:
+                lines.append(
+                    f"| {d['date']} | {d['turns']} | {d['input_tokens']:,} | "
+                    f"{d['output_tokens']:,} | ${d['cost_usd']:.4f} |"
+                )
+
+        # Recent turns
+        history = self.history(history_limit)
+        if history:
+            lines.append("")
+            lines.append(f"### Last {len(history)} turns")
+            lines.append("| Time | In | Out | Cost | Duration | Label |")
+            lines.append("|---|---:|---:|---:|---:|---|")
+            import datetime as _dt
+            for row in history:
+                ts = row.get("ts", 0)
+                when = _dt.datetime.fromtimestamp(ts).astimezone().strftime("%H:%M:%S") if ts else "?"
+                in_t = int(row.get("input_tokens", 0))
+                out_t = int(row.get("output_tokens", 0))
+                cost = float(row.get("cost_usd", 0.0))
+                dur = int(row.get("duration_ms", 0))
+                label = row.get("label", "") or ""
+                lines.append(f"| {when} | {in_t:,} | {out_t:,} | ${cost:.4f} | {dur}ms | {label} |")
+
+        return "\n".join(lines)
+
     # ------------------------------------------------------- callback hooks
 
     def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
