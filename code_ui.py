@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import os
 import uuid
 from pathlib import Path
@@ -32,6 +33,13 @@ from pathlib import Path
 import chainlit as cl
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
+
+_secret_file = Path(__file__).parent / ".chainlit.secret"
+if not _secret_file.exists():
+    _secret_file.write_text(secrets.token_hex(32), encoding="utf-8")
+os.environ.setdefault(
+    "CHAINLIT_AUTH_SECRET", _secret_file.read_text(encoding="utf-8").strip()
+)
 
 load_dotenv()
 
@@ -425,10 +433,5 @@ def _format_tool_args(args: dict) -> str:
 
 # ─────────────────────────── entrypoint ──────────────────────────────────────
 
-if __name__ == "__main__":
-    import sys
-    from chainlit.cli import run_chainlit
-
-    port = int(os.environ.get("CODE_UI_PORT", 8500))
-    host = os.environ.get("CODE_UI_HOST", "0.0.0.0")
-    run_chainlit(__file__)
+# Run this application using the Chainlit CLI:
+# chainlit run code_ui.py --port 8500
