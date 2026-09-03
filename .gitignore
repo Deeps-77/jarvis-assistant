@@ -23,3 +23,5 @@ documents/
 session-ses_*.md
 certs/
 chat_threads.db*
+# Jarvis code-assistant sandbox
+.jarvis-sandbox/
