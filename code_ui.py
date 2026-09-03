@@ -1,7 +1,7 @@
 """Jarvis Code Assistant — Chainlit UI (Phase 1).
 
 Run with:
-    chainlit run code_ui.py --port 8500
+    python code_ui.py
 
 Environment variables (in addition to existing .env):
     CHAINLIT_CODE_USERNAME   — UI login username  (default: webuser)
@@ -27,8 +27,12 @@ import json
 import logging
 import secrets
 import os
+import sys
 import uuid
 from pathlib import Path
+
+os.environ["LITERAL_TELEMETRY_OFF"] = "true"
+sys.path.insert(0, str(Path(__file__).parent))
 
 import chainlit as cl
 from dotenv import load_dotenv
