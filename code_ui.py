@@ -433,5 +433,18 @@ def _format_tool_args(args: dict) -> str:
 
 # ─────────────────────────── entrypoint ──────────────────────────────────────
 
-# Run this application using the Chainlit CLI:
-# chainlit run code_ui.py --port 8500
+# Run this application using:
+# python code_ui.py
+
+if __name__ == "__main__":
+    import uvicorn
+    from chainlit.server import app as server_app
+
+    port = int(os.environ.get("CODE_UI_PORT", 8500))
+    host = os.environ.get("CODE_UI_HOST", "0.0.0.0")
+
+    logger.info("Starting Code Assistant UI on http://%s:%d", host, port)
+    uvicorn.run(
+        server_app, host=host, port=port, timeout_graceful_shutdown=5
+    )
+
