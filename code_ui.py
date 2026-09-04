@@ -97,6 +97,7 @@ from code_assistant.workspace import (  # noqa: E402
     Workspace,
     WorkspaceRegistry,
 )
+from code_assistant.tools import set_workspace as _set_tools_workspace  # noqa: E402
 from llm_provider import LLMConfig  # noqa: E402
 from token_usage import TokenTracker  # noqa: E402
 
@@ -172,6 +173,52 @@ def _open_workspace(root_str: str) -> Workspace:
     ws.ensure_sandbox()
     _registry().touch(ws)
     return ws
+
+
+# --------------------------------------------------------------- file tree element
+
+
+async def _build_file_tree(root: Path, max_depth: int = 3, current_depth: int = 0) -> list[dict]:
+    """Build a file tree structure for the UI."""
+    if current_depth > max_depth:
+        return []
+    
+    items = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except (PermissionError, OSError):
+        return []
+    
+    for entry in entries:
+        # Skip hidden files
+        if entry.name.startswith("."):
+            continue
+        
+        item = {
+            "name": entry.name,
+            "path": str(entry),
+            "is_dir": entry.is_dir(),
+            "children": [],
+        }
+        
+        if entry.is_dir() and current_depth < max_depth:
+            item["children"] = await _build_file_tree(entry, max_depth, current_depth + 1)
+        
+        items.append(item)
+    
+    return items
+
+
+async def _render_file_tree_element(root: Path) -> cl.CustomElement:
+    """Render a file tree custom element for the sidebar."""
+    tree_data = await _build_file_tree(Path(root))
+    return cl.CustomElement(
+        name="FileTree",
+        props={
+            "root": str(root),
+            "tree": tree_data,
+        },
+    )
 
 
 def _build_brain(workspace: Workspace) -> tuple[CodeBrain, TokenTracker]:
@@ -279,29 +326,116 @@ async def on_chat_start():
             content=f"Workspace opened: `{ws.root}` (mode: **plan**)"
         ).send()
     else:
-        recent = _registry().list()
-        if recent:
-            listing = "\n".join(
-                f"- `{e.root}`  _(last used {e.last_used})_" for e in recent[:5]
-            )
-            await cl.Message(
-                content=(
-                    "Pick a workspace by typing its absolute path. "
-                    f"Recent workspaces:\n{listing}\n\n"
-                    "Type `/workspace <path>` to switch."
-                )
-            ).send()
-        else:
-            await cl.Message(
-                content=(
-                    "Pick a workspace by typing its absolute path "
-                    "(e.g. `D:\\Projects\\myrepo` or `/home/me/code/myrepo`).\n\n"
-                    "Type `/workspace <path>` to switch."
-                )
-            ).send()
+        # Show file tree picker for workspace selection
+        await _show_workspace_picker()
 
     await _send_welcome()
     await _refresh_sidebar()
+
+
+async def _show_workspace_picker(current_path: Path | None = None) -> None:
+    """Show an interactive file tree picker for workspace selection."""
+    # Start from home directory or current path
+    root = current_path if current_path else Path.home()
+    
+    # Build initial file tree
+    tree_data = await _build_file_tree(root, max_depth=2)
+    
+    # Send file tree element
+    tree_element = cl.CustomElement(
+        name="FileTreePicker",
+        props={
+            "root": str(root),
+            "tree": tree_data,
+            "mode": "select",
+        },
+    )
+    
+    await cl.Message(
+        content=(
+            f"📁 **Select a workspace** (current: `{root}`)\n\n"
+            "Browse the file tree below and click a folder to select it as your workspace.\n"
+            "Click `📂` to expand/collapse folders. Click `✅ Select` to confirm.\n"
+            "You can also type `/workspace <path>` manually."
+        ),
+        elements=[tree_element],
+    ).send()
+    
+    recent = _registry().list()
+    if recent:
+        listing = "\n".join(
+            f"- `{e.root}`  _(last used {e.last_used})_" for e in recent[:5]
+        )
+        await cl.Message(
+            content=(
+                "Recent workspaces:\n"
+                f"{listing}\n\n"
+                "Type `/workspace <path>` to switch."
+            )
+        ).send()
+    else:
+        await cl.Message(
+            content=(
+                "Tip: You can also type `/workspace <path>` manually "
+                "(e.g. `D:\\Projects\\myrepo` or `/home/me/code/myrepo`)."
+            )
+        ).send()
+
+
+# ---------------------------------------------------------------- file tree actions
+
+
+@cl.action_callback("filetree_select")
+async def _on_filetree_select(action: cl.Action) -> None:
+    """Handle file tree folder selection."""
+    payload = action.payload
+    action_type = payload.get("action")
+    path_str = payload.get("path")
+    
+    if not path_str:
+        return
+    
+    path = Path(path_str)
+    
+    if action_type == "expand":
+        # Expand folder - send updated tree
+        tree_data = await _build_file_tree(path, max_depth=2)
+        tree_element = cl.CustomElement(
+            name="FileTreePicker",
+            props={
+                "root": str(path),
+                "tree": tree_data,
+                "mode": "select",
+            },
+        )
+        await cl.Message(
+            content=f"📁 **Browsing:** `{path}`",
+            elements=[tree_element],
+        ).send()
+    
+    elif action_type == "select":
+        # User selected this folder as workspace
+        if not path.is_dir():
+            await cl.Message(content=f"⚠️ `{path}` is not a directory.").send()
+            return
+        
+        try:
+            ws = _open_workspace(str(path))
+        except Exception as e:
+            await cl.Message(content=f"Cannot open workspace: {e}").send()
+            return
+        
+        brain, tracker = _build_brain(path)
+        cl.user_session.set("workspace_root", str(path))
+        cl.user_session.set("brain", brain)
+        cl.user_session.set("tracker", tracker)
+        cl.user_session.set("visible_text", [])
+        
+        await cl.Message(
+            content=f"✅ Workspace set to `{path}` (mode: **plan**)"
+        ).send()
+        await _refresh_sidebar()
+        await _send_welcome()
 
 
 # ---------------------------------------------------------------- commands
@@ -364,6 +498,36 @@ async def _cmd_reset() -> None:
     await cl.Message(content="Chat history cleared.").send()
 
 
+async def _cmd_browse(path_str: str) -> None:
+    """Browse the file tree at the given path (or current workspace)."""
+    if path_str:
+        path = Path(path_str.strip().strip('"').strip("'"))
+    else:
+        root = _workspace_root()
+        if not root:
+            await cl.Message(content="No workspace open. Use `/workspace <path>` first.").send()
+            return
+        path = Path(root)
+    
+    if not path.exists() or not path.is_dir():
+        await cl.Message(content=f"Path does not exist or is not a directory: `{path}`").send()
+        return
+    
+    tree_data = await _build_file_tree(path, max_depth=2)
+    tree_element = cl.CustomElement(
+        name="FileTreePicker",
+        props={
+            "root": str(path),
+            "tree": tree_data,
+            "mode": "browse",
+        },
+    )
+    await cl.Message(
+        content=f"📁 **Browsing:** `{path}`\n\nClick `📂` to expand folders. Click `✅ Select` to open as workspace.",
+        elements=[tree_element],
+    ).send()
+
+
 # --------------------------------------------------------------- message
 
 
@@ -381,6 +545,9 @@ async def on_message(message: cl.Message):
             return
         if cmd == "/mode":
             await _cmd_mode(arg)
+            return
+        if cmd == "/browse":
+            await _cmd_browse(arg)
             return
         if cmd == "/usage":
             await _cmd_usage()

@@ -88,6 +88,77 @@ def _looks_like_tool_call_json(delta: str) -> bool:
     return ('"name"' in s and ('"arguments"' in s or '"args"' in s)) or s.startswith('{"tool"')
 
 
+def _extract_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
+    """Extract tool calls from model content when they are serialized as JSON.
+    
+    Handles multiple formats:
+    - {"name": "...", "arguments": {...}}
+    - {"name": "...", "args": {...}}
+    - [{"name": "...", "arguments": {...}}, ...]
+    """
+    if not content or not content.strip().startswith("{"):
+        return []
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and "name" in parsed:
+            args = parsed.get("arguments") if "arguments" in parsed else parsed.get("args", {})
+            return [{
+                "id": f"content_{hash(content) % 10000}",
+                "name": parsed.get("name"),
+                "args": args if isinstance(args, dict) else {},
+            }]
+        elif isinstance(parsed, list):
+            tool_calls = []
+            for item in parsed:
+                if isinstance(item, dict) and "name" in item:
+                    args = item.get("arguments") if "arguments" in item else item.get("args", {})
+                    tool_calls.append({
+                        "id": f"content_{hash(str(item)) % 10000}",
+                        "name": item.get("name"),
+                        "args": args if isinstance(args, dict) else {},
+                    })
+            return tool_calls
+    except json.JSONDecodeError:
+        pass
+    return []
+
+
+def _accumulate_tool_call_chunks(chunks: list[dict]) -> list[dict]:
+    """Accumulate tool_call_chunks from streamed chunks into complete tool calls."""
+    if not chunks:
+        return []
+    
+    # Group by tool call index
+    tool_calls: dict[int, dict] = {}
+    for chunk in chunks:
+        idx = chunk.get("index", 0)
+        if idx not in tool_calls:
+            tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+        
+        tc = tool_calls[idx]
+        if "id" in chunk and chunk["id"]:
+            tc["id"] = chunk["id"]
+        if "name" in chunk and chunk["name"]:
+            tc["name"] += chunk["name"]
+        if "arguments" in chunk and chunk["arguments"]:
+            tc["arguments"] += chunk["arguments"]
+    
+    result = []
+    for idx in sorted(tool_calls.keys()):
+        tc = tool_calls[idx]
+        if tc["name"]:
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {}
+            result.append({
+                "id": tc["id"] or f"tool_{idx}",
+                "name": tc["name"],
+                "args": args,
+            })
+    return result
+
+
 @dataclass(slots=True)
 class BrainEvent:
     """A single update from :meth:`CodeBrain.run` consumed by the UI."""
@@ -363,16 +434,62 @@ class CodeBrain:
         events: list[BrainEvent] = []
         final_chunk: AIMessageChunk | None = None
         text_parts: list[str] = []
+        tool_call_chunks: list[dict] = []
+        
         async for chunk in self._llm.astream(messages):
             text = _content_to_str(getattr(chunk, "content", "") or "")
             if text:
                 text_parts.append(text)
                 events.append(BrainEvent(type="token", data={"data": text}))
+            
+            # Collect tool_call_chunks from streamed chunks (for models that support it)
+            tcc = getattr(chunk, "tool_call_chunks", None) or []
+            for tc_chunk in tcc:
+                # Convert LangChain's tool_call_chunk to dict
+                tc_dict = {
+                    "index": getattr(tc_chunk, "index", 0),
+                    "id": getattr(tc_chunk, "id", None),
+                    "name": getattr(tc_chunk, "name", None),
+                    "arguments": getattr(tc_chunk, "args", None) or getattr(tc_chunk, "arguments", None),
+                }
+                # Filter out None values
+                tc_dict = {k: v for k, v in tc_dict.items() if v is not None}
+                if tc_dict:
+                    tool_call_chunks.append(tc_dict)
+            
             if isinstance(chunk, AIMessageChunk):
                 final_chunk = chunk
+        
+        # Build the final AI message
+        full_text = "".join(text_parts)
+        
+        # First, try to use structured tool_calls from the final chunk
+        tool_calls = []
+        if final_chunk is not None:
+            tool_calls = list(getattr(final_chunk, "tool_calls", None) or [])
+        
+        # If no structured tool_calls, try to extract from content
+        if not tool_calls and _looks_like_tool_call_json(full_text):
+            tool_calls = _extract_tool_calls_from_content(full_text)
+        
+        # If still no tool calls, try to accumulate from tool_call_chunks
+        if not tool_calls and tool_call_chunks:
+            accumulated = _accumulate_tool_call_chunks(tool_call_chunks)
+            if accumulated:
+                tool_calls = accumulated
+        
+        # Create the final AIMessage
         if final_chunk is None:
-            final_chunk = AIMessageChunk(content="".join(text_parts))
-        return events, final_chunk
+            ai_message = AIMessage(content=full_text, tool_calls=tool_calls)
+        else:
+            # Use the final_chunk but override tool_calls if we found better ones
+            ai_message = AIMessage(
+                content=full_text,
+                tool_calls=tool_calls if tool_calls else getattr(final_chunk, "tool_calls", None) or [],
+            )
+        
+        # Note: we don't yield here; the caller will iterate the returned events
+        return events, AIMessage(content=full_text, tool_calls=tool_calls)
 
     async def _execute_tool_calls(
         self,
