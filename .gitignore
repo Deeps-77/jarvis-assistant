@@ -22,5 +22,6 @@ documents/
 .chainlit.secret
 .code_ui.secret
 code_workspaces.json
+code_sessions.json
 certs/
 chat_threads.db*

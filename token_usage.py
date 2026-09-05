@@ -39,7 +39,7 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
-from llm_provider import LLMProvider, estimate_cost_usd
+from llm_provider import CODEX_TIER_LABEL, LLMProvider, cloud_equivalent_cost_usd, estimate_cost_usd
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ class TokenTracker(BaseCallbackHandler):
             t = self.totals
             avg_in = t.input_tokens // t.turns if t.turns else 0
             avg_out = t.output_tokens // t.turns if t.turns else 0
+            cloud = cloud_equivalent_cost_usd(t.input_tokens, t.output_tokens)
             return {
                 "session_id": self.session_id,
                 "provider": self.provider,
@@ -140,9 +141,44 @@ class TokenTracker(BaseCallbackHandler):
                 "avg_input": avg_in,
                 "avg_output": avg_out,
                 "cost_usd": round(t.cost_usd, 6),
+                "cloud_cost_usd": round(cloud, 6),
+                "saved_usd": round(max(cloud - t.cost_usd, 0.0), 6),
                 "first_ts": t.first_ts,
                 "last_ts": t.last_ts,
             }
+
+    def lifetime_saved_usd(self) -> float:
+        """Total API spend avoided across all sessions in the JSONL log.
+
+        Sums the Codex-tier equivalent per row minus recorded actual cost.
+        Estimate only (server-reported counts); local power/hardware excluded.
+        """
+        if not self.log_path.exists():
+            return 0.0
+        saved = 0.0
+        try:
+            with self.log_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        in_tok = int(row.get("input_tokens", 0))
+                        out_tok = int(row.get("output_tokens", 0))
+                        actual = float(row.get("cost_usd", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    saved += max(cloud_equivalent_cost_usd(in_tok, out_tok) - actual, 0.0)
+        except OSError as e:
+            logger.warning("TokenTracker lifetime_saved read failed: %s", e)
+            return 0.0
+        return round(saved, 6)
 
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
         """Last ``limit`` turns as plain dicts (most recent first)."""
@@ -156,6 +192,95 @@ class TokenTracker(BaseCallbackHandler):
         with self._lock:
             self.totals = TokenTotals()
             self._turns.clear()
+
+    def rehydrate(self, session_id: str) -> int:
+        """Rebuild in-memory totals from JSONL rows for ``session_id``.
+
+        Used when reopening a saved chat so ``/usage`` continues where the
+        session left off. Returns the number of rows loaded.
+        """
+        loaded = 0
+        if not self.log_path.exists():
+            return 0
+        try:
+            with self.log_path.open("r", encoding="utf-8") as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("TokenTracker rehydrate read failed: %s", e)
+            return 0
+        with self._lock:
+            self.totals = TokenTotals()
+            self._turns.clear()
+            for row in rows:
+                if not isinstance(row, dict) or row.get("session_id") != session_id:
+                    continue
+                try:
+                    turn = TurnUsage(
+                        session_id=session_id,
+                        ts=float(row.get("ts", 0)),
+                        provider=str(row.get("provider", "")),
+                        model=str(row.get("model", "")),
+                        input_tokens=int(row.get("input_tokens", 0)),
+                        output_tokens=int(row.get("output_tokens", 0)),
+                        cost_usd=float(row.get("cost_usd", 0.0)),
+                        duration_ms=int(row.get("duration_ms", 0)),
+                        label=str(row.get("label", "") or ""),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                t = self.totals
+                t.input_tokens += turn.input_tokens
+                t.output_tokens += turn.output_tokens
+                t.cost_usd += turn.cost_usd
+                t.turns += 1
+                if not t.first_ts:
+                    t.first_ts = turn.ts
+                t.last_ts = turn.ts
+                self._turns.append(turn)
+                loaded += 1
+            if len(self._turns) > self._max_memory:
+                del self._turns[: len(self._turns) - self._max_memory]
+        return loaded
+
+    def purge_session(self, session_id: str) -> int:
+        """Delete all JSONL rows for ``session_id`` + reset matching memory.
+
+        Used by session delete (history + usage both purged). Returns the
+        number of rows removed. Other sessions' rows are preserved via an
+        atomic rewrite.
+        """
+        removed = 0
+        if self.log_path.exists():
+            try:
+                with self.log_path.open("r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+            except OSError as e:
+                logger.warning("TokenTracker purge read failed: %s", e)
+                lines = []
+            kept: list[str] = []
+            for line in lines:
+                try:
+                    row = json.loads(line) if line.strip() else None
+                except json.JSONDecodeError:
+                    kept.append(line)
+                    continue
+                if isinstance(row, dict) and row.get("session_id") == session_id:
+                    removed += 1
+                else:
+                    kept.append(line)
+            if removed:
+                try:
+                    tmp = self.log_path.with_suffix(".jsonl.tmp")
+                    tmp.write_text("".join(kept), encoding="utf-8")
+                    tmp.replace(self.log_path)
+                except OSError as e:
+                    logger.warning("TokenTracker purge rewrite failed: %s", e)
+                    removed = 0
+        with self._lock:
+            if self.session_id == session_id:
+                self.totals = TokenTotals()
+                self._turns.clear()
+        return removed
 
     def daily_summary(self, days: int = 7) -> list[dict[str, Any]]:
         """Read the JSONL log and aggregate usage per local day.
@@ -246,6 +371,13 @@ class TokenTracker(BaseCallbackHandler):
         lines.append(f"- Input: **{snap['input_tokens']:,}**  ·  Output: **{snap['output_tokens']:,}**  ·  Total: **{snap['total_tokens']:,}**")
         lines.append(f"- Avg in/out per turn: **{snap['avg_input']:,}** / **{snap['avg_output']:,}**")
         lines.append(f"- Est. cost: **${snap['cost_usd']:.4f}**")
+        lines.append(
+            f"- 💰 API spend avoided (this session, vs {CODEX_TIER_LABEL}): "
+            f"**${snap['saved_usd']:.4f}** (est.)"
+        )
+        lifetime = self.lifetime_saved_usd()
+        if lifetime > 0:
+            lines.append(f"- 💰 Lifetime avoided (all sessions): **${lifetime:.4f}** (est.)")
         if snap["first_ts"]:
             import datetime as _dt
             f = _dt.datetime.fromtimestamp(snap["first_ts"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")

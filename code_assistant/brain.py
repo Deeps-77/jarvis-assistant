@@ -79,48 +79,140 @@ FORCE_FINAL_PROMPT = (
 )
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove Qwen3 ``<think>...</think>`` blocks; tool JSON comes after them."""
+    if "<think>" in text and "</think>" in text:
+        parts = text.split("</think>", 1)
+        return parts[1] if len(parts) > 1 else text
+    return text
+
+
 def _looks_like_tool_call_json(delta: str) -> bool:
     """True when streamed content is the model serialising a tool call as
-    raw text instead of using the structured ``tool_calls`` channel."""
-    s = (delta or "").lstrip()
-    if not s.startswith("{"):
+    raw text instead of using the structured ``tool_calls`` channel.
+
+    Handles Qwen3/Hermes styles: bare JSON, ```json fences,
+    ``<tool_call>`` / ``<function_call>`` / ``[TOOL_CALLS]`` wrappers.
+    """
+    s = _strip_thinking(delta or "").strip()
+    if not s:
         return False
-    return ('"name"' in s and ('"arguments"' in s or '"args"' in s)) or s.startswith('{"tool"')
+    markers = ('"name"', '"function"', '"tool"', "<tool_call", "<function_call", "[TOOL_CALLS]")
+    return any(m in s for m in markers)
+
+
+def _candidate_json_blocks(text: str) -> list[str]:
+    """Pull candidate JSON payloads out of fences, tags, and brace spans."""
+    import re
+    import uuid as _uuid  # local to avoid touching module imports
+
+    out: list[str] = []
+    s = _strip_thinking(text or "")
+    # 1. Fenced blocks ```json ... ``` or ``` ... ```
+    for m in re.finditer(r"```(?:json)?\s*(.*?)```", s, re.DOTALL | re.IGNORECASE):
+        out.append(m.group(1).strip())
+    # 2. <tool_call>...</tool_call> and <function_call>...</function_call>
+    for m in re.finditer(r"<(?:tool_call|function_call)>(.*?)</(?:tool_call|function_call)>", s, re.DOTALL | re.IGNORECASE):
+        out.append(m.group(1).strip())
+    # 3. Whole-text array [ {...}, {...} ]
+    stripped = s.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        out.append(stripped)
+    # 4. Balanced-brace spans containing a tool marker
+    for m in re.finditer(r"\{[^{}]*\"(?:name|function|tool)\"[^{}]*\}", s, re.DOTALL):
+        out.append(m.group(0))
+    # 5. Raw text as last resort
+    out.append(s.strip())
+    # De-dupe, keep order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for b in out:
+        if b and b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    return uniq
+
+
+def _normalise_one_call(item: Any) -> dict[str, Any] | None:
+    """Normalise one parsed dict into {id, name, args} or None if invalid."""
+    import uuid
+    if not isinstance(item, dict):
+        return None
+    # Hermes style: {"function": {"name": ..., "arguments": ...}}
+    if "function" in item and isinstance(item["function"], dict):
+        fn = item["function"]
+        name = fn.get("name")
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+    elif "tool" in item and isinstance(item["tool"], str) and "name" not in item:
+        # {"tool": "read_file", "args"/"parameters": {...}}
+        name = item.get("tool")
+        args = item.get("args", item.get("parameters", item.get("input", {})))
+    else:
+        name = item.get("name")
+        args = item.get("arguments", item.get("args", item.get("parameters", {})))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+    if not name or not isinstance(name, str):
+        return None
+    if not isinstance(args, dict):
+        args = {}
+    return {"id": f"content_{uuid.uuid4().hex[:8]}", "name": name.strip(), "args": args}
 
 
 def _extract_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
     """Extract tool calls from model content when they are serialized as JSON.
-    
-    Handles multiple formats:
-    - {"name": "...", "arguments": {...}}
-    - {"name": "...", "args": {...}}
-    - [{"name": "...", "arguments": {...}}, ...]
+
+    Handles:
+    - {"name": "...", "arguments": {...}} / {"args": {...}}
+    - [{"name": ...}, ...] and newline-delimited JSON objects
+    - ```json fences, <tool_call>/<function_call> tags (Qwen3/Hermes)
+    - {"function": {"name": ..., "arguments": ...}} nesting
     """
-    if not content or not content.strip().startswith("{"):
+    if not content or not _looks_like_tool_call_json(content):
         return []
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict) and "name" in parsed:
-            args = parsed.get("arguments") if "arguments" in parsed else parsed.get("args", {})
-            return [{
-                "id": f"content_{hash(content) % 10000}",
-                "name": parsed.get("name"),
-                "args": args if isinstance(args, dict) else {},
-            }]
+    calls: list[dict[str, Any]] = []
+    for block in _candidate_json_blocks(content):
+        # Try whole block as JSON first
+        parsed = _safe_json_loads(block)
+        if isinstance(parsed, dict):
+            one = _normalise_one_call(parsed)
+            if one:
+                calls.append(one)
+                continue
         elif isinstance(parsed, list):
-            tool_calls = []
             for item in parsed:
-                if isinstance(item, dict) and "name" in item:
-                    args = item.get("arguments") if "arguments" in item else item.get("args", {})
-                    tool_calls.append({
-                        "id": f"content_{hash(str(item)) % 10000}",
-                        "name": item.get("name"),
-                        "args": args if isinstance(args, dict) else {},
-                    })
-            return tool_calls
-    except json.JSONDecodeError:
-        pass
-    return []
+                one = _normalise_one_call(item)
+                if one:
+                    calls.append(one)
+            if calls:
+                continue
+        # Try newline-delimited JSON objects inside the block
+        for line in block.splitlines():
+            line = line.strip().rstrip(",")
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            one = _normalise_one_call(_safe_json_loads(line))
+            if one:
+                calls.append(one)
+        if calls:
+            break
+    # De-dupe identical (name, args) pairs, keep order
+    seen: set[str] = set()
+    uniq: list[dict[str, Any]] = []
+    for c in calls:
+        key = json.dumps({"name": c["name"], "args": c["args"]}, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq
 
 
 def _accumulate_tool_call_chunks(chunks: list[dict]) -> list[dict]:
@@ -143,16 +235,23 @@ def _accumulate_tool_call_chunks(chunks: list[dict]) -> list[dict]:
         if "arguments" in chunk and chunk["arguments"]:
             tc["arguments"] += chunk["arguments"]
     
+    import uuid
     result = []
     for idx in sorted(tool_calls.keys()):
         tc = tool_calls[idx]
         if tc["name"]:
-            try:
-                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-            except json.JSONDecodeError:
-                args = {}
+            raw_args = tc["arguments"]
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
             result.append({
-                "id": tc["id"] or f"tool_{idx}",
+                "id": tc["id"] or f"tool_{idx}_{uuid.uuid4().hex[:6]}",
                 "name": tc["name"],
                 "args": args,
             })
@@ -163,8 +262,13 @@ def _accumulate_tool_call_chunks(chunks: list[dict]) -> list[dict]:
 class BrainEvent:
     """A single update from :meth:`CodeBrain.run` consumed by the UI."""
 
-    type: str  # token | tool_start | tool_end | approval_required | usage | done | error
+    # token | thinking | tool_start | tool_end | approval_required | usage | done | error
+    type: str
     data: dict[str, Any] = field(default_factory=dict)
+
+
+#: Cap on streamed reasoning chars per model round (thinking traces are verbose).
+MAX_REASONING_CHARS = 4000
 
 
 @dataclass(slots=True)
@@ -206,6 +310,7 @@ class CodeBrain:
         self._provider, self._llm = build_provider(self._config, callbacks=callbacks)
         self._tools: list[BaseTool] = filter_tools(ALL_TOOLS, self.mode)
         self._tool_map = {t.name: t for t in ALL_TOOLS}
+        self._llm_with_tools = self._bind_current_tools()
         self._history: list[BaseMessage] = []
         self._approval_event = asyncio.Event()
         self._approval_decision: ApprovalDecision | None = None
@@ -226,15 +331,33 @@ class CodeBrain:
 
     # -------------------------------------------------------------- mutators
 
+    def _bind_current_tools(self):
+        """Bind the active toolset to the LLM; fall back to raw LLM on failure."""
+        try:
+            return self._llm.bind_tools(self._tools)
+        except Exception:
+            logger.warning("bind_tools failed; continuing without structured tool binding")
+            return self._llm
+
     def set_mode(self, mode: Mode) -> None:
         if mode == self.mode:
             return
         self.mode = mode
         self._tools = filter_tools(ALL_TOOLS, self.mode)
+        self._llm_with_tools = self._bind_current_tools()
         set_current_mode(self.mode.value)
 
     def reset_history(self) -> None:
         self._history.clear()
+
+    def export_history(self) -> list[BaseMessage]:
+        """Return a copy of the conversation history for session persistence."""
+        return list(self._history)
+
+    def import_history(self, messages: list[BaseMessage]) -> None:
+        """Replace history with previously exported messages (session resume)."""
+        self._history = list(messages or [])
+        self._trim_history()
 
     def workspace_root(self) -> str:
         return str(self.workspace.root)
@@ -277,6 +400,7 @@ class CodeBrain:
                 self._tools.append(tool)
         self._tool_map = {t.name: t for t in ALL_TOOLS}
         self._tool_map.update(self._custom_tools)
+        self._llm_with_tools = self._bind_current_tools()
 
     def override_prompt(self, mode: Mode, suffix: str) -> None:
         """Append or replace a system prompt suffix for a given mode.
@@ -346,30 +470,23 @@ class CodeBrain:
         t0 = time.perf_counter()
         final_text: str = ""
         try:
-            for round_num in range(MAX_TOOL_ROUNDS):
+            for round_num in range(self.max_tool_rounds):
                 # ---- model round ----
                 stream_events, ai_message = await self._stream_model_round(messages)
                 for ev in stream_events:
                     yield ev
 
                 tool_calls = list(getattr(ai_message, "tool_calls", None) or [])
-                # Small-model fallback: parse content-JSON if no structured calls.
+                # Belt and suspenders: _stream_model_round already tries
+                # content-JSON, but retry here in case tokens arrived without
+                # triggering it (e.g. thinking tags interleaved).
                 if not tool_calls:
                     full_text = "".join(
                         e.data.get("data", "") for e in stream_events if e.type == "token"
                     )
                     if _looks_like_tool_call_json(full_text):
-                        parsed = _safe_json_loads(full_text)
-                        if isinstance(parsed, dict) and "name" in parsed:
-                            tool_calls = [
-                                {
-                                    "id": f"text_{round_num}",
-                                    "name": parsed.get("name"),
-                                    "args": parsed.get("arguments")
-                                    if "arguments" in parsed
-                                    else parsed.get("args", {}),
-                                }
-                            ]
+                        tool_calls = _extract_tool_calls_from_content(full_text)
+                        if tool_calls:
                             # Replace the AI message with a tool-calling one.
                             ai_message = AIMessage(content="", tool_calls=tool_calls)
 
@@ -381,7 +498,21 @@ class CodeBrain:
 
                 if not tool_calls:
                     final_text = ai_message.content if isinstance(ai_message.content, str) else ""
-                    break
+                    if final_text.strip():
+                        break
+                    # Empty round (thinking model emitted nothing usable):
+                    # nudge once instead of surrendering with "(no response)".
+                    # Counts against max_tool_rounds so it always terminates.
+                    nudge = HumanMessage(
+                        content=(
+                            "Your last response contained neither text nor a tool call. "
+                            "Reply now: either call one of the listed tools with valid "
+                            "arguments, or answer the user's request in plain prose."
+                        )
+                    )
+                    messages.append(nudge)
+                    logger.warning("CodeBrain: empty model round %d; nudging", round_num)
+                    continue
 
                 # ---- tool round ----
                 tool_events, tool_messages = await self._execute_tool_calls(tool_calls)
@@ -435,13 +566,48 @@ class CodeBrain:
         final_chunk: AIMessageChunk | None = None
         text_parts: list[str] = []
         tool_call_chunks: list[dict] = []
-        
-        async for chunk in self._llm.astream(messages):
+        streamed_calls: dict[str, dict] = {}
+        streamed_invalid: list[dict] = []
+        reasoning_chars = 0
+
+        model = getattr(self, "_llm_with_tools", None) or self._llm
+        async for chunk in model.astream(messages):
             text = _content_to_str(getattr(chunk, "content", "") or "")
             if text:
                 text_parts.append(text)
                 events.append(BrainEvent(type="token", data={"data": text}))
+
+            # Thinking trace (only present when the provider is built with
+            # reasoning=True and the model thinks). Streamed so the UI can
+            # show progress during long generations instead of sitting silent.
+            addl = getattr(chunk, "additional_kwargs", None) or {}
+            thinking = addl.get("reasoning_content") or ""
+            if thinking and reasoning_chars < MAX_REASONING_CHARS:
+                room = MAX_REASONING_CHARS - reasoning_chars
+                piece = thinking[:room]
+                reasoning_chars += len(piece)
+                events.append(BrainEvent(type="thinking", data={"data": piece}))
             
+            # Collect structured calls from EVERY chunk (LangChain may surface
+            # the complete call on any chunk, not just the last one).
+            for tc in getattr(chunk, "tool_calls", None) or []:
+                try:
+                    cid = tc.get("id") or f"stream_{len(streamed_calls)}"
+                    streamed_calls[cid] = {
+                        "id": cid,
+                        "name": tc.get("name") or "",
+                        "args": tc.get("args") if isinstance(tc.get("args"), dict) else {},
+                    }
+                except (AttributeError, TypeError):
+                    continue
+            # Keep malformed calls too — the Parable/Qwen3 finetune sometimes
+            # emits bad JSON args; we repair them below instead of going silent.
+            for bad in getattr(chunk, "invalid_tool_calls", None) or []:
+                try:
+                    streamed_invalid.append(dict(bad))
+                except (TypeError, ValueError):
+                    continue
+
             # Collect tool_call_chunks from streamed chunks (for models that support it)
             tcc = getattr(chunk, "tool_call_chunks", None) or []
             for tc_chunk in tcc:
@@ -462,34 +628,55 @@ class CodeBrain:
         
         # Build the final AI message
         full_text = "".join(text_parts)
-        
-        # First, try to use structured tool_calls from the final chunk
-        tool_calls = []
-        if final_chunk is not None:
-            tool_calls = list(getattr(final_chunk, "tool_calls", None) or [])
-        
-        # If no structured tool_calls, try to extract from content
+
+        # 1. Structured calls seen on any streamed chunk (most reliable).
+        tool_calls = [c for c in streamed_calls.values() if c.get("name")]
+
+        # 2. Malformed calls: repair what we can (known name + coerced args).
+        if not tool_calls and streamed_invalid:
+            for bad in streamed_invalid:
+                name = bad.get("name") or ""
+                raw_args = bad.get("args")
+                args: dict[str, Any] = {}
+                if isinstance(raw_args, dict):
+                    args = raw_args
+                elif isinstance(raw_args, str) and raw_args.strip():
+                    candidate = _normalise_one_call({"name": name, "arguments": raw_args})
+                    if candidate:
+                        args = candidate["args"]
+                if name:
+                    import uuid
+                    tool_calls.append({
+                        "id": bad.get("id") or f"repaired_{uuid.uuid4().hex[:6]}",
+                        "name": name,
+                        "args": args,
+                    })
+
+        # 3. Text-serialised JSON (small-model fallback).
         if not tool_calls and _looks_like_tool_call_json(full_text):
             tool_calls = _extract_tool_calls_from_content(full_text)
-        
-        # If still no tool calls, try to accumulate from tool_call_chunks
+
+        # 4. Accumulated tool_call_chunks.
         if not tool_calls and tool_call_chunks:
             accumulated = _accumulate_tool_call_chunks(tool_call_chunks)
             if accumulated:
                 tool_calls = accumulated
+
+        # 5. Final-chunk fallback (covers providers that only set the last chunk).
+        if not tool_calls and final_chunk is not None:
+            tool_calls = list(getattr(final_chunk, "tool_calls", None) or [])
         
-        # Create the final AIMessage
+        # Create the final AIMessage (override with extracted calls if found).
         if final_chunk is None:
             ai_message = AIMessage(content=full_text, tool_calls=tool_calls)
         else:
-            # Use the final_chunk but override tool_calls if we found better ones
             ai_message = AIMessage(
                 content=full_text,
                 tool_calls=tool_calls if tool_calls else getattr(final_chunk, "tool_calls", None) or [],
             )
-        
+
         # Note: we don't yield here; the caller will iterate the returned events
-        return events, AIMessage(content=full_text, tool_calls=tool_calls)
+        return events, ai_message
 
     async def _execute_tool_calls(
         self,
@@ -506,12 +693,54 @@ class CodeBrain:
         events: list[BrainEvent] = []
         tool_messages: list[ToolMessage] = []
 
+        allowed_names = {t.name for t in self._tools}
         for idx, tc in enumerate(tool_calls):
             name = tc.get("name") or ""
             args = tc.get("args") or {}
             call_id = tc.get("id") or f"call_{idx}"
 
             events.append(BrainEvent(type="tool_start", data={"name": name, "args": args}))
+
+            # Pre-approval validation: fail fast without prompting the user.
+            if not isinstance(args, dict):
+                result_text = f"ERROR: invalid args for {name!r}: must be an object."
+                events.append(
+                    BrainEvent(
+                        type="tool_end",
+                        data={"name": name, "output": result_text, "tool_call_id": call_id},
+                    )
+                )
+                tool_messages.append(
+                    ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+                )
+                continue
+            if name not in self._tool_map:
+                result_text = f"ERROR: unknown tool {name!r}"
+                events.append(
+                    BrainEvent(
+                        type="tool_end",
+                        data={"name": name, "output": result_text, "tool_call_id": call_id},
+                    )
+                )
+                tool_messages.append(
+                    ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+                )
+                continue
+            if name not in allowed_names:
+                result_text = (
+                    f"ERROR: {name} is not available in {self.mode.value.upper()} mode. "
+                    f"Switch to BUILD with `/mode build` for write/exec tools."
+                )
+                events.append(
+                    BrainEvent(
+                        type="tool_end",
+                        data={"name": name, "output": result_text, "tool_call_id": call_id},
+                    )
+                )
+                tool_messages.append(
+                    ToolMessage(content=result_text, tool_call_id=call_id, name=name)
+                )
+                continue
 
             needs_approval = name in self._approval_registry
             if needs_approval:
@@ -583,7 +812,7 @@ class CodeBrain:
     # ----------------------------------------------------------- internals
 
     def _trim_history(self) -> None:
-        while len(self._history) > MAX_HISTORY_MESSAGES:
+        while len(self._history) > self.max_history_messages:
             self._history.pop(0)
         while self._history and not isinstance(self._history[0], HumanMessage):
             self._history.pop(0)
@@ -619,4 +848,5 @@ __all__ = [
     "BrainEvent",
     "ApprovalDecision",
     "MAX_TOOL_ROUNDS",
+    "MAX_REASONING_CHARS",
 ]

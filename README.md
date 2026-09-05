@@ -174,7 +174,7 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ## 🔒 Security & privacy notes
 
 - Message content stays on your machine except when the model explicitly queries public APIs (search/weather/FX/crypto).
-- `.env` and all runtime data (`logs/`, `memory.db`, `chat_history.json`) are gitignored and never committed.
+- `.env` and all runtime data (`logs/`, `memory.db`, `chat_history.json`, `code_sessions.json`, `code_workspaces.json`) are gitignored and never committed.
 - If a token ever leaks, revoke it immediately via @BotFather.
 - `logs/activity.log` contains message previews — it stays local; treat it as sensitive.
 
@@ -183,13 +183,15 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ```
 main.py                Telegram adapter: handlers, auth, markdown→HTML pipeline
 app.py                 Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
-code_ui.py             Chainlit code-assistant adapter (Phase 1+; workspace, mode toggle, streaming, approval gate)
+code_ui.py             Chainlit code-assistant adapter (workspace + chat sessions, mode, streaming, approval gate)
 core.py                backend-agnostic chat agent brain (shared by all chat frontends)
-code_assistant/        code-assistant brain + tools (Phase 2: read + write + approval)
+code_assistant/        code-assistant brain + tools (read + write + approval)
   workspace.py         Workspace model + path validation + saved-workspaces registry
   tools.py             LangChain @tool functions (read + write + exec; mode-gated)
   modes.py             Plan/Build mode enum + tool gating + system prompts
   brain.py             CodeBrain manual ReAct loop with approval gate, streams BrainEvents
+  sessions.py          Per-workspace chat sessions (save/resume/rename/delete, JSON registry)
+  config.py            Optional code_assistant.yaml harness config loader
   sandbox.py           subprocess sandbox: env strip, timeout, output cap, copy_out
 tools.py               nine chat tools (search + live facts + document RAG)
 llm_provider.py        Ollama + OpenAI provider abstraction (Phase 0)
@@ -263,33 +265,61 @@ discipline tool, **not** a security boundary — local single-user only.
 
 | Command | Effect |
 |---|---|
-| `/workspace <path>` | Switch to a different folder |
-| `/mode plan` / `/mode build` | Toggle mode (Build = read-only until approval-gated writes flow) |
-| `/usage` | Token usage summary + last 10 turns |
+| `/workspace <path>` | Switch to a different folder (then pick a chat) |
+| `/browse [path]` | Browse the file tree with button navigation |
+| `/mode plan` / `/mode build` | Toggle mode (also in the gear-icon panel by the typing area) |
+| `/sessions` | List saved chats in this workspace |
+| `/new [title]` | Start a new chat |
+| `/open <id>` | Resume a chat (id prefix works) |
+| `/rename <title>` | Rename the active chat |
+| `/delete [id]` | Delete a chat — history **and** token-usage rows purged |
+| `/usage` | Token usage summary + savings vs cloud |
+| `/status` | Workspace/chat/mode/usage at a glance (no sidebar popup) |
 | `/reset` | Clear this chat's history |
 | `/help` | Show the welcome card again |
 
 ### Workspace picker
 
 - Type an absolute path (e.g. `D:\Projects\myrepo`) to open a project
-  root. The UI remembers the last few workspaces in
+  root, use `📂 Browse folders…` for the OS dialog, or `/browse` for
+  in-chat navigation. The UI remembers recent workspaces in
   `code_workspaces.json`.
 - Every call is validated: paths must be relative, traversal (`..`) is
   refused, and a deny-glob list hides `.git/`, `.venv/`,
   `node_modules/`, `.jarvis-sandbox/`, build artefacts, etc.
 
+### Chat sessions (per workspace)
+
+Each workspace holds up to 20 saved chats (`code_sessions.json`).
+Opening a workspace shows its chats — resume one or start new. History
+(including tool calls), mode, and token totals are restored; the chat
+pane replays the last 50 messages. Titles auto-derive from the first
+message (`/rename` to change). `/delete` purges both history and usage
+rows; other sessions are untouched.
+
 ### Live token observation
 
-Every LLM call goes through `TokenTracker`; the sidebar shows
-per-session input/output totals and an estimated USD cost (OpenAI only;
-Ollama is local → $0). `/usage` prints the last 10 turns.
+Every LLM call goes through `TokenTracker`. `/usage` prints session
+totals, a 7-day roll-up, recent turns, and a **💰 API-spend-avoided**
+line: what the same tokens would cost at a Codex-tier cloud rate
+(GPT-5.3-Codex $1.75/$14 per 1M, Jun-2026 list) vs $0 local — per
+session and lifetime. Estimates only (server-reported counts; local
+power/hardware excluded).
+
+### Status without popups
+
+The sidebar refreshes only on workspace/session/mode/open events —
+never after routine turns (each refresh pops it open). Live numbers live
+in `/usage` and `/status`; mode also sits in the gear-icon ChatSettings
+panel next to the typing area.
 
 ### Streaming events
 
-The agent streams `BrainEvent`s (`token` / `tool_start` / `tool_end` /
-`approval_required` / `usage` / `done` / `error`) instead of returning
-one big string, so the UI can show tool chips, retract intermediate
-chatter, and update the usage card live.
+The agent streams `BrainEvent`s (`token` / `thinking` / `tool_start` /
+`tool_end` / `approval_required` / `usage` / `done` / `error`) instead
+of returning one big string. Thinking traces stream into a live
+“🤔 Thinking…” message (on by default, `CODE_LLM_REASONING=false` to
+disable), tool calls render as chips, and the usage card updates live.
 
 ### Cross-provider
 
@@ -327,15 +357,26 @@ The code assistant brain is fully **additive** — `core.py` / `tools.py` /
 
 | Provider | Recommended | Notes |
 |---|---|---|
-| Ollama | `qwen2.5-coder:7b-instruct` (or larger) | Strong tool-calling discipline. The 3B variant in `.env.example` works but sometimes drops tool calls on long refactors. |
+| Ollama | `hf.co/mradermacher/Parable-Qwen3-4B-Claude-Fable-5-i1-GGUF:latest` (default) | Agentic Qwen3-4B finetune; structured tool calls verified in this loop. Qwen3 wants temp ~0.6 (auto) — 0.1 causes repetition loops. |
+| Ollama (4GB VRAM) | same, with `CODE_LLM_NUM_CTX=8192` | 32K ctx spills a 4B model to CPU (~30% GPU); 8K fits ~100% GPU and is plenty for ≤24-message histories. |
+| Ollama (fast/2B) | `qwen3.5:2b-q4_K_M` | 2B tool-use leader; fully fits 4GB even at large ctx; weaker reasoning. |
 | OpenAI | `gpt-4o-mini` | Cheap, reliable tool-calling. Set `CODE_LLM_PROVIDER=openai` + `CODE_LLM_API_KEY`. |
+
+### Tool calling under the hood
+
+Tools are bound via `bind_tools` (refreshed on every mode switch), so
+capable models emit structured calls. For small/thinking local models
+there are three safety nets: Qwen3/Hermes text fallbacks (fences,
+`<tool_call>` tags, multi-call arrays), malformed-call repair, and an
+empty-round nudge instead of a silent `(no response)`. Unknown or
+off-mode tools fail fast *before* the approval prompt. `run_command`
+is hard-blocked in Plan mode like every other write tool.
 
 ### Known limits (Phase 2)
 
-- The brain streams tool-call chatter as raw JSON with small local models
-  (the model's structured `tool_calls` channel is unreliable below ~7B).
-  The UI auto-detects and retracts that text so the user only sees the
-  structured tool chip.
+- Story/agentic finetunes (like Parable) are nondeterministic: identical
+  prompts occasionally yield empty rounds. The nudge + repair nets above
+  cover this; a retry almost always succeeds.
 - The sandbox kills the subprocess on timeout, but on Windows the child
   process tree can linger in the background briefly. Use `delete_path`
   to clean up sandbox artefacts if needed.

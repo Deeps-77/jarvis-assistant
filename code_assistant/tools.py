@@ -767,7 +767,9 @@ def run_command(
     Returns:
         Rendered ``RunResult`` text — stdout/stderr, exit code, duration.
     """
-    _require_build_mode()
+    _err = _require_build_mode()
+    if _err is not None:
+        return _err
     ws = _config_workspace(None)
     try:
         result = run_in_sandbox(

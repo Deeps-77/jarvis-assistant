@@ -44,14 +44,36 @@ logger = logging.getLogger(__name__)
 
 
 # Default model per provider; only used when the env doesn't specify one.
-DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:3b-instruct-q4_K_M"
+# Primary target is the Parable Qwen3-4B agentic finetune (imatrix Q4_K_M):
+# `ollama run hf.co/mradermacher/Parable-Qwen3-4B-Claude-Fable-5-i1-GGUF:Q4_K_M`
+DEFAULT_OLLAMA_MODEL = "hf.co/mradermacher/Parable-Qwen3-4B-Claude-Fable-5-i1-GGUF:latest"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
+
+def _is_qwen3_family(model: str) -> bool:
+    m = (model or "").lower()
+    return any(k in m for k in ("qwen3", "parable", "fable"))
+
+
+def _default_temperature(model: str, provider: str) -> float:
+    # Qwen3 thinking models degrade with greedy decoding (repetition/loops);
+    # upstream recommends ~0.6 for thinking, ~0.7 non-thinking. Use 0.6.
+    if provider == "ollama" and _is_qwen3_family(model):
+        return 0.6
+    return 0.1
+
+
+def _default_num_ctx(model: str, provider: str) -> int:
+    # Qwen3-4B natively supports 32k; tool schemas + thinking traces need room.
+    if provider == "ollama" and _is_qwen3_family(model):
+        return 32768
+    return 16384
+
 # Cheap static price table (USD per 1M tokens) for the usage dashboard.
-# Ollama is local → free. OpenAI numbers are the public list prices; refresh
-# quarterly from https://openai.com/api/pricing/.
+# Ollama is local → free. Cloud numbers are the public list prices; refresh
+# quarterly (last refresh: Jun 2026).
 _OPENAI_PRICES_PER_1M: dict[str, dict[str, float]] = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 2.50, "output": 10.00},
@@ -59,6 +81,11 @@ _OPENAI_PRICES_PER_1M: dict[str, dict[str, float]] = {
     "gpt-4.1": {"input": 2.00, "output": 8.00},
     "o4-mini": {"input": 1.10, "output": 4.40},
 }
+
+# Reference cloud coder-agent rate for the "API spend avoided" line.
+# GPT-5.3-Codex, Jun 2026 list price (per 1M tokens).
+CODEX_TIER_PER_1M: dict[str, float] = {"input": 1.75, "output": 14.00}
+CODEX_TIER_LABEL = "GPT-5.3-Codex tier"
 
 
 def estimate_cost_usd(provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
@@ -69,6 +96,17 @@ def estimate_cost_usd(provider: str, model: str, input_tokens: int, output_token
     if not prices:
         return 0.0
     return (input_tokens / 1_000_000) * prices["input"] + (output_tokens / 1_000_000) * prices["output"]
+
+
+def cloud_equivalent_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    """What these tokens would cost at the reference Codex-tier cloud rate.
+
+    Used for the "API spend avoided" estimate shown for local runs.
+    """
+    return (
+        (input_tokens / 1_000_000) * CODEX_TIER_PER_1M["input"]
+        + (output_tokens / 1_000_000) * CODEX_TIER_PER_1M["output"]
+    )
 
 
 @dataclass(slots=True)
@@ -88,6 +126,7 @@ class LLMConfig:
     timeout: int = 600
     keep_alive: str = "-1"
     max_tokens: int = 0  # 0 = provider default
+    reasoning: bool = True  # expose thinking traces (reasoning_content) when supported
     # Capability flags (auto-detected or manually set via config/env)
     supports_vision: bool = False
     supports_structured_output: bool = False
@@ -120,7 +159,8 @@ class LLMConfig:
         With ``prefix="CODE_"``:
             CODE_LLM_PROVIDER, CODE_LLM_MODEL, CODE_LLM_BASE_URL,
             CODE_LLM_API_KEY, CODE_LLM_TEMPERATURE, CODE_LLM_NUM_CTX,
-            CODE_LLM_TIMEOUT, CODE_LLM_KEEP_ALIVE, CODE_LLM_MAX_TOKENS.
+            CODE_LLM_TIMEOUT, CODE_LLM_KEEP_ALIVE, CODE_LLM_MAX_TOKENS,
+            CODE_LLM_REASONING (true/false, default true).
 
         With ``prefix=""`` (chat brain compatibility):
             OLLAMA_MODEL is read; provider is forced to ``ollama``; api_key and
@@ -166,16 +206,23 @@ class LLMConfig:
                 logger.warning("Invalid float for %s%s=%r; using default %s", prefix, name, raw, default)
                 return default
 
+        def _bool(name: str, default: bool) -> bool:
+            raw = _get(name).lower()
+            if not raw:
+                return default
+            return raw in ("1", "true", "yes", "y", "on")
+
         return cls(
             provider=provider,
             model=model,
             base_url=base_url,
             api_key=api_key,
-            temperature=_float("LLM_TEMPERATURE", 0.1),
-            num_ctx=_int("LLM_NUM_CTX", 16384),
+            temperature=_float("LLM_TEMPERATURE", _default_temperature(model, provider)),
+            num_ctx=_int("LLM_NUM_CTX", _default_num_ctx(model, provider)),
             timeout=_int("LLM_TIMEOUT", 600),
             keep_alive=_get("LLM_KEEP_ALIVE", "-1") or "-1",
             max_tokens=_int("LLM_MAX_TOKENS", 0),
+            reasoning=_bool("LLM_REASONING", True),
         )
 
     def describe(self) -> str:
@@ -273,6 +320,13 @@ class OllamaProvider(LLMProvider):
         )
         if self.config.max_tokens:
             kwargs["num_predict"] = self.config.max_tokens
+        if _is_qwen3_family(self.config.model):
+            # Quantized Qwen3 loops without a mild repetition penalty.
+            kwargs["repeat_penalty"] = 1.1
+        if self.config.reasoning:
+            # Surface thinking traces as reasoning_content per chunk so the
+            # UI can stream them instead of sitting silent on long generations.
+            kwargs["reasoning"] = True
         if callbacks:
             kwargs["callbacks"] = callbacks
         return ChatOllama(**kwargs)
@@ -346,6 +400,9 @@ __all__ = [
     "OpenAIProvider",
     "build_provider",
     "estimate_cost_usd",
+    "cloud_equivalent_cost_usd",
+    "CODEX_TIER_LABEL",
+    "CODEX_TIER_PER_1M",
     "DEFAULT_OLLAMA_MODEL",
     "DEFAULT_OPENAI_MODEL",
 ]
