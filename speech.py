@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -8,6 +9,16 @@ from pathlib import Path
 import botlog
 
 logger = logging.getLogger(__name__)
+
+# Default vendored Piper locations (see README voice-mode section).
+# The user downloads these manually once; afterwards synthesis is offline.
+DEFAULT_PIPER_EXE = Path(__file__).parent / "vendor" / "piper" / "piper.exe"
+DEFAULT_PIPER_MODEL = (
+    Path(__file__).parent / "vendor" / "piper" / "voices" / "en_US-lessac-high.onnx"
+)
+
+# Hard cap per synthesis so a runaway reply can't wedge the voice loop.
+MAX_SYNTH_CHARS = 1000
 
 
 class SpeechTranscriber:
@@ -113,5 +124,103 @@ class SpeechTranscriber:
             if tmp_path:
                 try:
                     os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
+# ------------------------------------------------------------- Piper TTS
+
+
+def piper_paths() -> tuple[Path, Path]:
+    """Resolve (binary, voice model) from env with vendored defaults."""
+    exe = Path(os.environ.get("VOICE_PIPER_EXE", str(DEFAULT_PIPER_EXE)))
+    model = Path(os.environ.get("VOICE_PIPER_MODEL", str(DEFAULT_PIPER_MODEL)))
+    return exe, model
+
+
+def piper_available() -> tuple[bool, str]:
+    """Cheap pre-flight check. Returns (ok, reason)."""
+    exe, model = piper_paths()
+    if not exe.exists():
+        return False, f"Piper binary not found: {exe}"
+    if not model.exists():
+        return False, f"Piper voice model not found: {model}"
+    if not Path(str(model) + ".json").exists():
+        return False, f"Piper voice config missing: {model}.json"
+    return True, "ok"
+
+
+def _clean_for_speech(text: str) -> str:
+    """Strip markdown/code artefacts TTS would read aloud literally."""
+    import re
+
+    text = re.sub(r"```.*?```", " code snippet omitted. ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[#*_>|-]{1,}", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_SYNTH_CHARS:
+        # Cut at a sentence boundary so speech doesn't end mid-word.
+        cut = text.rfind(". ", 0, MAX_SYNTH_CHARS)
+        text = text[: cut + 1] if cut > 0 else text[:MAX_SYNTH_CHARS]
+    return text
+
+
+class PiperSpeaker:
+    """Offline TTS via the vendored Piper binary (WAV bytes out)."""
+
+    def __init__(self) -> None:
+        self.speaker_id = os.environ.get("VOICE_PIPER_SPEAKER", "0")
+        self.timeout = int(os.environ.get("VOICE_PIPER_TIMEOUT", "30"))
+        self._lock = asyncio.Lock()
+
+    async def synthesize(self, text: str) -> bytes:
+        """Speak ``text``. Returns WAV bytes, or ``b""`` on any failure."""
+        ok, reason = piper_available()
+        if not ok:
+            logger.warning("Piper unavailable (%s); reply will be text-only", reason)
+            return b""
+        clean = _clean_for_speech(text)
+        if not clean:
+            return b""
+        exe, model = piper_paths()
+        try:
+            async with self._lock:
+                return await asyncio.to_thread(self._run_sync, exe, model, clean)
+        except Exception:
+            logger.exception("Piper synthesis failed")
+            return b""
+
+    def _run_sync(self, exe: Path, model: Path, text: str) -> bytes:
+        out_path = None
+        try:
+            fd, out_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            proc = subprocess.run(
+                [
+                    str(exe),
+                    "--model", str(model),
+                    "--output_file", out_path,
+                    "--speaker", str(self.speaker_id),
+                    "--quiet",
+                ],
+                input=text.encode("utf-8"),
+                capture_output=True,
+                timeout=self.timeout,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "Piper exited %d: %s", proc.returncode,
+                    proc.stderr.decode("utf-8", "replace")[:300],
+                )
+                return b""
+            return Path(out_path).read_bytes()
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("Piper run failed: %s", e)
+            return b""
+        finally:
+            if out_path:
+                try:
+                    os.unlink(out_path)
                 except OSError:
                     pass

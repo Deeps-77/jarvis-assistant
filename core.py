@@ -421,7 +421,10 @@ async def respond(
     owner: str | None = None,
     on_token=None,
     on_retry=None,
+    ephemeral: bool = False,
 ) -> tuple[str, list[str], bool]:
+    """Drive one chat turn. When ``ephemeral`` is true (voice mode), the
+    turn skips vector-memory recall AND learning — nothing is retained."""
     history = chat_histories.setdefault(session_key, [])
     history.append(HumanMessage(content=text))
     trim_history(history)
@@ -431,7 +434,7 @@ async def respond(
         f"Current date and time: {now:%A}, {now:%d %B %Y}, {now:%I:%M %p} "
         f"({now:%Z}, UTC{now:%z}). Trust this above any other date information."
     )
-    if memory_store and memory_store.enabled:
+    if not ephemeral and memory_store and memory_store.enabled:
         t0 = time.perf_counter()
         recall_texts = await memory_store.search(session_key, text)
         if recall_texts:
@@ -468,7 +471,7 @@ async def respond(
 
     footer_sources = [] if (not failed and "couldn't find" in body.lower()) else sources
 
-    if memory_store and memory_store.enabled:
+    if not ephemeral and memory_store and memory_store.enabled:
         task = asyncio.create_task(
             memory_store.learn_from_exchange(session_key, text, stored_reply)
         )

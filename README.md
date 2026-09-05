@@ -142,6 +142,25 @@ On each device, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`,
 
 Telegram voice notes and Chainlit audio attachments (or the browser mic button) are transcribed locally by faster-whisper (`WHISPER_MODEL`, default `small`, int8 CPU with automatic CUDA when available — GPU detected on this machine). The transcript is echoed back ("🎤 I heard: …") and then answered through the full pipeline — search, live tools, documents, all of it.
 
+### 🎙️ Voice mode (web UI, ephemeral)
+
+Type `/voice on` (or flip the gear-icon switch) and just talk — mic turns are endpointed automatically, answered through the chat brain, and spoken back via offline Piper TTS. Text keeps working alongside. **Nothing is stored:** voice turns skip vector memory, logs keep counters only (no transcripts), and voice-only sessions are purged (thread + history) on chat end. Mixed sessions keep their text turns; voice words are never logged.
+
+One-time manual setup (fully offline afterwards):
+
+```powershell
+# 1. Engine: piper_windows_amd64.zip from github.com/rhasspy/piper releases
+#    Extract everything into vendor/piper/ (piper.exe + DLLs + espeak-ng-data)
+# 2. Voice: rhasspy/piper-voices → en/en_US/lessac/medium (or high):
+#    en_US-lessac-medium.onnx + en_US-lessac-medium.onnx.json
+#    into vendor/piper/voices/ (json name must match the onnx name exactly)
+# 3. Verify:
+.\vendor\piper\piper.exe --help
+cmd /c "echo Hello test. | vendor\piper\piper.exe --model vendor\piper\voices\en_US-lessac-high.onnx --output_file test.wav --debug"
+```
+
+Tuning knobs (`VOICE_SILENCE_MS`, `VOICE_MIN_SPEECH_MS`, `VOICE_MAX_TURN_MS`, `VOICE_VAD_THRESHOLD`, `VOICE_PIPER_*`) are documented in `.env.example`. Telegram voice replies are a planned follow-up — web only for now.
+
 ## 📡 Watching logs live
 
 ```bash
@@ -215,7 +234,8 @@ llm_provider.py        Ollama + OpenAI provider abstraction (Phase 0)
 token_usage.py         TokenTracker LangChain callback + JSONL persistence (Phase 0)
 docs.py                per-user document store (parse, chunk, embed, retrieve)
 memory.py              sqlite-vec long-term conversational memory
-speech.py              whisper-based speech transcription
+speech.py              whisper STT + Piper offline TTS (vendored binary)
+voice.py               mic VAD turn-taking + ephemeral voice-loop orchestration
 botlog.py              logging setup + human-readable event helpers
 watch_logs.py          colored terminal log follower
 ```

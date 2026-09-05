@@ -137,6 +137,8 @@ import botlog
 import core
 from datalayer import SQLiteDataLayer
 from paths import chat_threads_db, documents_dir, memory_db
+from speech import PiperSpeaker
+from voice import VoiceTurnTaker
 
 
 @cl.data_layer
@@ -162,24 +164,124 @@ def _pcm_to_wav_bytes(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
 
 _audio_buffers: dict[str, list[bytes]] = {}
 
+# Voice-mode state per browser session key: VAD turn-taker + busy flag so
+# overlapping utterances never stack, + the ephemeral chat key (never resumed).
+_voice_state: dict[str, dict] = {}
+_voice_speaker: PiperSpeaker | None = None
+
+
+def _voice_enabled() -> bool:
+    return bool(cl.user_session.get("voice_mode", False))
+
+
+def _voice_ctx(key: str) -> dict:
+    ctx = _voice_state.get(key)
+    if ctx is None:
+        ctx = {"taker": VoiceTurnTaker(), "busy": False, "chat_key": None,
+               "voice_turns": 0, "text_turns": 0}
+        _voice_state[key] = ctx
+    return ctx
+
+
+def _get_speaker() -> PiperSpeaker:
+    global _voice_speaker
+    if _voice_speaker is None:
+        _voice_speaker = PiperSpeaker()
+    return _voice_speaker
+
+
+async def _run_voice_turn(key: str, utterance_pcm: bytes) -> None:
+    """One full voice turn: transcribe → respond (ephemeral) → speak."""
+    ctx = _voice_ctx(key)
+    if ctx["busy"]:
+        logger.debug("voice turn dropped: previous turn still running")
+        return
+    ctx["busy"] = True
+    try:
+        ctx["voice_turns"] += 1
+        transcript = await core.transcribe_audio(
+            _pcm_to_wav_bytes(utterance_pcm), "voice-turn.wav"
+        )
+        if not transcript or len(transcript.strip()) < 2:
+            return
+        owner = _username()
+        # Counters only: the words themselves are never logged or stored.
+        botlog.log_user_msg(owner, "-", "web UI", "🎙 voice turn (content withheld)", kind="voice")
+        if ctx["chat_key"] is None:
+            import uuid
+
+            ctx["chat_key"] = f"voice:{uuid.uuid4().hex[:12]}"
+        answer_msg = cl.Message(content="")
+        await answer_msg.send()
+        streamed: list[str] = []
+
+        async def on_token(token: str):
+            streamed.append(token)
+            await answer_msg.stream_token(token)
+
+        body, sources, failed = await core.respond(
+            ctx["chat_key"], transcript, owner=owner, on_token=on_token, ephemeral=True
+        )
+        if sources:
+            links = "\n".join(f"[{i}] {url}" for i, url in enumerate(sources, start=1))
+            body = f"{body}\n\n**Sources:**\n{links}"
+        answer_msg.content = body or "(no content)"
+        wav = await _get_speaker().synthesize(body)
+        if wav:
+            answer_msg.elements = [
+                cl.Audio(content=wav, mime="audio/wav", auto_play=True, name="reply.wav")
+            ]
+        await answer_msg.update()
+        botlog.log_reply(0, len(sources), "ok" if not failed else "gated-fallback")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("voice turn failed")
+        botlog.log_error_note(f"voice turn: {type(e).__name__}: {str(e)[:150]}")
+    finally:
+        ctx["busy"] = False
+
 
 @cl.on_audio_start
 async def on_audio_start():
     _audio_buffers[session_key()] = []
+    key = session_key()
+    if _voice_enabled():
+        _voice_ctx(key)["taker"].reset()
     return True
 
 
 @cl.on_audio_chunk
 async def on_audio_chunk(chunk) -> None:
     data = getattr(chunk, "data", None)
-    if data:
-        _audio_buffers.setdefault(session_key(), []).append(data)
+    if not data:
+        return
+    key = session_key()
+    if _voice_enabled():
+        utterance = _voice_ctx(key)["taker"].feed(bytes(data))
+        if utterance:
+            import asyncio as _asyncio
+
+            task = _asyncio.create_task(_run_voice_turn(key, utterance))
+            core._background_tasks.add(task)
+            task.add_done_callback(core._background_tasks.discard)
+    else:
+        _audio_buffers.setdefault(key, []).append(data)
 
 
 @cl.on_audio_end
 async def on_audio_end():
     ensure_setup()
-    chunks = _audio_buffers.pop(session_key(), [])
+    key = session_key()
+    if _voice_enabled():
+        # Mic released mid-utterance: collect partial speech, if any.
+        utterance = _voice_ctx(key)["taker"].flush()
+        if utterance:
+            import asyncio as _asyncio
+
+            task = _asyncio.create_task(_run_voice_turn(key, utterance))
+            core._background_tasks.add(task)
+            task.add_done_callback(core._background_tasks.discard)
+        return
+    chunks = _audio_buffers.pop(key, [])
     pcm = b"".join(chunks)
     if not pcm:
         await cl.Message(content="🎤 Empty recording.").send()
@@ -319,9 +421,81 @@ async def on_chat_start():
             f"- Attach a **PDF / DOCX / TXT / MD** file and I'll index it for Q&A.\n"
             f"- Attach an **image** and I'll analyze it.\n"
             f"- Type `list my documents` to see what's indexed.\n"
-            f"- Your past conversations appear in the sidebar — click to resume."
+            f"- Your past conversations appear in the sidebar — click to resume.\n"
+            f"- 🎙 **Voice mode**: type `/voice on` (or flip the gear-icon switch), "
+            f"then just talk — replies come back spoken. Nothing is stored."
         )
     ).send()
+    from chainlit.input_widget import Switch
+
+    await cl.ChatSettings(
+        inputs=[
+            Switch(
+                id="voice_mode",
+                label="🎙 Voice mode",
+                initial=False,
+                description="Mic turns auto-respond with voice. Ephemeral: nothing stored.",
+            ),
+        ]
+    ).send()
+
+
+@cl.on_settings_update
+async def on_settings_update(settings: dict) -> None:
+    if "voice_mode" not in (settings or {}):
+        return
+    await _set_voice_mode(bool(settings["voice_mode"]), source="panel")
+
+
+async def _set_voice_mode(on: bool, source: str = "command") -> None:
+    cl.user_session.set("voice_mode", on)
+    if on:
+        ok, reason = _piper_check()
+        if not ok:
+            cl.user_session.set("voice_mode", False)
+            await cl.Message(
+                content=f"🎙 Voice mode needs Piper TTS ({reason}). "
+                f"See README voice-mode section, then `/voice on` again."
+            ).send()
+            return
+        await cl.Message(
+            content="🎙 **Voice mode on** — talk naturally; I'll reply out loud. "
+            "Nothing is stored. `/voice off` to stop."
+        ).send()
+    else:
+        await cl.Message(content="🎙 Voice mode off.").send()
+    botlog.log_user_msg(_username(), "-", "web UI", f"voice mode {source}={'on' if on else 'off'}")
+
+
+def _piper_check() -> tuple[bool, str]:
+    from speech import piper_available
+
+    return piper_available()
+
+
+@cl.on_chat_end
+async def on_chat_end():
+    """Purge ephemeral voice state: no threads, no history, no memory.
+
+    The stored thread is deleted only when the session was voice-only;
+    mixed sessions keep their text turns (voice words were never logged).
+    """
+    key = cl.user_session.get("session_key") or ""
+    ctx = _voice_state.pop(key, None)
+    chat_key = (ctx or {}).get("chat_key")
+    if chat_key:
+        core.chat_histories.pop(chat_key, None)
+    voice_only = bool(ctx) and ctx.get("voice_turns", 0) > 0 and ctx.get("text_turns", 0) == 0
+    if not voice_only:
+        return
+    try:
+        thread_id = cl.context.session.thread_id
+    except Exception:
+        return
+    try:
+        await get_data_layer().delete_thread(thread_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("voice thread purge failed: %s", e)
 
 
 @cl.on_chat_resume
@@ -338,6 +512,19 @@ async def on_chat_resume(thread: "ThreadDict"):
 async def on_message(message: cl.Message):
     ensure_setup()
     owner = _username()
+
+    text_cmd = (message.content or "").strip().lower()
+    if text_cmd.startswith("/voice"):
+        arg = text_cmd[len("/voice"):].strip()
+        if arg in ("on", "off"):
+            await _set_voice_mode(arg == "on")
+        else:
+            await _set_voice_mode(not _voice_enabled())
+        return
+
+    ctx = _voice_state.get(session_key())
+    if ctx is not None:
+        ctx["text_turns"] += 1
 
     notes: list[str] = []
     transcripts: list[str] = []
