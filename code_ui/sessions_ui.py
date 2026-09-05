@@ -7,6 +7,7 @@ import chainlit as cl
 
 from code_assistant.modes import Mode
 from code_assistant.sessions import ChatSession, auto_title
+from code_assistant.workspace import Workspace
 from llm_provider import LLMConfig
 from token_usage import TokenTracker
 
@@ -15,8 +16,10 @@ from .chrome import _push_settings, _refresh_sidebar
 from .state import (
     _brain,
     _build_brain,
+    _chat_session_id,
     _current_mode,
     _open_workspace,
+    _sessions,
     _tracker,
     _tracker_sid_for,
     _workspace_root,

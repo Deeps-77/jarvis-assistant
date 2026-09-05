@@ -29,8 +29,8 @@ from .commands import (
     _cmd_usage,
     _cmd_workspace,
 )
-from .sessions_ui import _ensure_session, _persist_session
-from .state import _brain, _open_workspace
+from .sessions_ui import _ensure_session, _persist_session, _show_session_picker
+from .state import _brain, _current_mode, _open_workspace
 from .workspace_ui import _show_workspace_picker
 
 
