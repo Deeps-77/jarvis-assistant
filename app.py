@@ -138,7 +138,7 @@ import core
 from datalayer import SQLiteDataLayer
 from paths import chat_threads_db, documents_dir, memory_db
 from speech import PiperSpeaker
-from voice import VoiceTurnTaker
+from voice import TARGET_RATE, VOICE_THREAD_META, VoiceTurnTaker, resample_pcm
 
 
 @cl.data_layer
@@ -160,6 +160,56 @@ def _pcm_to_wav_bytes(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
         wav.setframerate(rate)
         wav.writeframes(pcm)
     return buffer.getvalue()
+
+
+def _mic_input_rate() -> int:
+    """Browser mic delivery rate (AudioContext hardware rate, ~48kHz)."""
+    try:
+        return int(os.environ.get("VOICE_INPUT_RATE", "") or 48000)
+    except ValueError:
+        return 48000
+
+
+def _mic_to_16k_wav(pcm: bytes) -> bytes:
+    """Resample raw mic PCM to 16kHz WAV for faster-whisper.
+
+    The frontend ships int16 mono at device rate; labelling it 24kHz
+    (the old behaviour) plays it back half-speed to the recogniser and
+    yields empty/garbage transcripts.
+    """
+    return _pcm_to_wav_bytes(resample_pcm(pcm, _mic_input_rate(), TARGET_RATE), TARGET_RATE)
+
+
+async def _tag_voice_thread() -> None:
+    """Mark the current thread voice-only so history lists skip it."""
+    try:
+        thread_id = cl.context.session.thread_id
+    except Exception:
+        return
+    try:
+        await get_data_layer().update_thread(
+            thread_id, user_id=_username(), metadata=dict(VOICE_THREAD_META)
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("voice thread tag failed: %s", e)
+
+
+_voice_swept = False
+
+
+async def _sweep_voice_threads_once() -> None:
+    """Delete orphaned voice threads from crashed/closed sessions."""
+    global _voice_swept
+    if _voice_swept:
+        return
+    _voice_swept = True
+    try:
+        removed = await get_data_layer().purge_voice_threads()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("voice thread sweep failed: %s", e)
+        return
+    if removed:
+        logger.info("purged %d orphaned voice thread(s)", removed)
 
 
 _audio_buffers: dict[str, list[bytes]] = {}
@@ -199,8 +249,9 @@ async def _run_voice_turn(key: str, utterance_pcm: bytes) -> None:
     ctx["busy"] = True
     try:
         ctx["voice_turns"] += 1
+        await _tag_voice_thread()
         transcript = await core.transcribe_audio(
-            _pcm_to_wav_bytes(utterance_pcm), "voice-turn.wav"
+            _mic_to_16k_wav(utterance_pcm), "voice-turn.wav"
         )
         if not transcript or len(transcript.strip()) < 2:
             return
@@ -246,6 +297,9 @@ async def on_audio_start():
     key = session_key()
     if _voice_enabled():
         _voice_ctx(key)["taker"].reset()
+        await cl.Message(
+            content="🎙 Listening — speak naturally; I'll jump in when you pause."
+        ).send()
     return True
 
 
@@ -286,7 +340,7 @@ async def on_audio_end():
     if not pcm:
         await cl.Message(content="🎤 Empty recording.").send()
         return
-    transcript = await core.transcribe_audio(_pcm_to_wav_bytes(pcm), "mic.wav")
+    transcript = await core.transcribe_audio(_mic_to_16k_wav(pcm), "mic.wav")
     if not transcript:
         await cl.Message(content="🎤 I couldn't hear anything. Try again closer to the mic.").send()
         return
@@ -414,6 +468,7 @@ async def handle_attachments(elements) -> tuple[list[str], list[str], list[tuple
 @cl.on_chat_start
 async def on_chat_start():
     ensure_setup()
+    await _sweep_voice_threads_once()
     await cl.Message(
         content=(
             f"Hello! I'm Jarvis, running locally on this machine.\n\n"

@@ -347,6 +347,28 @@ class SQLiteDataLayer(BaseDataLayer):
     async def delete_thread(self, thread_id: str):
         await asyncio.to_thread(self._delete_thread_sync, thread_id)
 
+    async def purge_voice_threads(self) -> int:
+        """Delete all voice-tagged threads (startup sweep for orphans).
+
+        Returns the number of threads removed. Voice chats are ephemeral:
+        without this, crashed/closed sessions leave rows that can never
+        be meaningfully reopened.
+        """
+        return await asyncio.to_thread(self._purge_voice_sync)
+
+    def _purge_voice_sync(self) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id FROM threads
+                   WHERE metadata LIKE '%"is_voice": true%'"""
+            ).fetchall()
+            for (tid,) in rows:
+                self._conn.execute("DELETE FROM steps WHERE thread_id = ?", (tid,))
+                self._conn.execute("DELETE FROM elements WHERE thread_id = ?", (tid,))
+                self._conn.execute("DELETE FROM threads WHERE id = ?", (tid,))
+            self._conn.commit()
+            return len(rows)
+
     def _delete_thread_sync(self, thread_id: str):
         with self._lock:
             rowids = [
@@ -364,7 +386,11 @@ class SQLiteDataLayer(BaseDataLayer):
         search = filters.search
 
         def _list_sync():
-            clauses, params = ["1 = 1"], []
+            # Voice-mode chats are tagged {"is_voice": true} and never
+            # listed: selecting a purged/ephemeral thread errored in the UI.
+            clauses, params = [
+                """(metadata IS NULL OR metadata NOT LIKE '%"is_voice": true%')"""
+            ], []
             if owner:
                 clauses.append("owner = ?")
                 params.append(owner)

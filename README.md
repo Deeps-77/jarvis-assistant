@@ -144,7 +144,9 @@ Telegram voice notes and Chainlit audio attachments (or the browser mic button) 
 
 ### 🎙️ Voice mode (web UI, ephemeral)
 
-Type `/voice on` (or flip the gear-icon switch) and just talk — mic turns are endpointed automatically, answered through the chat brain, and spoken back via offline Piper TTS. Text keeps working alongside. **Nothing is stored:** voice turns skip vector memory, logs keep counters only (no transcripts), and voice-only sessions are purged (thread + history) on chat end. Mixed sessions keep their text turns; voice words are never logged.
+Type `/voice on` (or flip the gear-icon switch) and just talk — mic turns are endpointed automatically, answered through the chat brain, and spoken back via offline Piper TTS. Text keeps working alongside. **Nothing is stored:** voice turns skip vector memory, logs keep counters only (no transcripts), and voice chats are tagged invisible so they never appear in history (orphans purged at startup; best-effort delete on chat end). Mixed sessions keep their text turns; voice words are never logged.
+
+Mic audio arrives at device rate (~48kHz) and is resampled server-side to Whisper-native 16kHz — this also fixed the old push-to-talk mic path, which had the same mismatch. Override with `VOICE_INPUT_RATE` if your hardware differs.
 
 One-time manual setup (fully offline afterwards):
 

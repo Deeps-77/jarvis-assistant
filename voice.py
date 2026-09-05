@@ -41,11 +41,96 @@ def _rms_int16(frame: bytes) -> float:
         return (total / n) ** 0.5
 
 
+#: Whisper-native rate. All mic audio is resampled here before VAD/transcribe.
+TARGET_RATE = 16000
+
+
+def _to_float_norm(pcm: bytes) -> "list[float]":
+    """int16 mono bytes -> normalized floats, numpy fast path else stdlib."""
+    if not pcm:
+        return []
+    try:
+        import numpy as np
+
+        return (np.frombuffer(pcm, dtype=np.int16).astype("float64") / 32768.0).tolist()
+    except ImportError:
+        import struct
+
+        n = len(pcm) // 2
+        return [s / 32768.0 for (s,) in struct.iter_unpack("<h", pcm[: n * 2])]
+
+
+def _from_float_norm(samples: "list[float]") -> bytes:
+    try:
+        import numpy as np
+
+        arr = (np.asarray(samples, dtype="float64") * 32767.0).astype("<i2")
+        return arr.tobytes()
+    except ImportError:
+        import struct
+
+        return struct.pack(
+            "<%dh" % len(samples),
+            *[max(-32768, min(32767, int(round(s * 32767.0)))) for s in samples],
+        )
+
+
+def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int = TARGET_RATE) -> bytes:
+    """Resample int16 mono PCM between rates (browser mic ~= 48kHz).
+
+    Exact integer-ratio path (e.g. 48000 -> 16000) uses a moving-average
+    prefilter + decimation; other ratios use linear interpolation. No
+    third-party deps beyond optional numpy.
+    """
+    if not pcm or src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate:
+        return pcm
+    samples = _to_float_norm(pcm)
+    if not samples:
+        return b""
+    n_in = len(samples)
+    n_out = max(1, round(n_in * dst_rate / src_rate))
+    if src_rate % dst_rate == 0:
+        factor = src_rate // dst_rate
+        try:
+            import numpy as np
+
+            arr = np.asarray(samples, dtype="float64")
+            kernel = np.ones(factor) / factor
+            smooth = np.convolve(arr, kernel, mode="same")
+            out = smooth[::factor][:n_out]
+            return _from_float_norm(out.tolist())
+        except ImportError:
+            window = [0.0] * factor
+            total, out = 0.0, []
+            for i, s in enumerate(samples):
+                total += s - window[i % factor]
+                window[i % factor] = s
+                if i % factor == factor - 1:
+                    out.append(total / factor)
+            return _from_float_norm(out[:n_out])
+    try:
+        import numpy as np
+
+        old_idx = np.linspace(0.0, 1.0, n_in)
+        new_idx = np.linspace(0.0, 1.0, n_out)
+        out = np.interp(new_idx, old_idx, np.asarray(samples, dtype="float64"))
+        return _from_float_norm(out.tolist())
+    except ImportError:
+        out = []
+        for i in range(n_out):
+            pos = i * (n_in - 1) / max(n_out - 1, 1)
+            lo, frac = int(pos), pos - int(pos)
+            hi = min(lo + 1, n_in - 1)
+            out.append(samples[lo] * (1 - frac) + samples[hi] * frac)
+        return _from_float_norm(out)
+
+
 @dataclass(slots=True)
 class VoiceConfig:
     """Tuning knobs (all overridable via ``VOICE_*`` env vars)."""
 
-    sample_rate: int = 24000
+    # Device/mic rate as delivered by the browser (usually 48000).
+    input_rate: int = 48000
     frame_ms: int = 30
     # RMS energy above this counts as speech (int16 scale: 0..32768).
     threshold: float = 500.0
@@ -71,7 +156,7 @@ class VoiceConfig:
                 return default
 
         return cls(
-            sample_rate=_int("VOICE_SAMPLE_RATE", 24000),
+            input_rate=_int("VOICE_INPUT_RATE", 48000),
             frame_ms=_int("VOICE_FRAME_MS", 30),
             threshold=_float("VOICE_VAD_THRESHOLD", 500.0),
             silence_ms=_int("VOICE_SILENCE_MS", 1000),
@@ -98,7 +183,7 @@ class VoiceTurnTaker:
 
     @property
     def frame_bytes(self) -> int:
-        return int(self.config.sample_rate * self.config.frame_ms / 1000) * 2
+        return int(self.config.input_rate * self.config.frame_ms / 1000) * 2
 
     @property
     def has_pending_speech(self) -> bool:
@@ -149,4 +234,8 @@ class VoiceTurnTaker:
         return self._finish()
 
 
-__all__ = ["VoiceConfig", "VoiceTurnTaker"]
+#: Thread metadata marker that hides voice chats from history lists.
+VOICE_THREAD_META = {"is_voice": True}
+
+
+__all__ = ["TARGET_RATE", "VOICE_THREAD_META", "VoiceConfig", "VoiceTurnTaker", "resample_pcm"]

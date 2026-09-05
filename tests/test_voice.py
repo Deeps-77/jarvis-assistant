@@ -12,22 +12,25 @@ from speech import PiperSpeaker, _clean_for_speech, piper_available
 from voice import VoiceConfig, VoiceTurnTaker
 
 
+RATE = 48000  # browser mic delivery rate
+
+
 def _cfg(**kw):
     base = dict(
-        sample_rate=24000, frame_ms=30, threshold=500.0,
+        input_rate=RATE, frame_ms=30, threshold=500.0,
         silence_ms=300, max_turn_ms=30000, min_speech_ms=200,
     )
     base.update(kw)
     return VoiceConfig(**base)
 
 
-def _tone(ms, amp=8000, hz=440):
-    n = int(24000 * ms / 1000)
-    return struct.pack("<%dh" % n, *[int(amp * math.sin(2 * math.pi * hz * i / 24000)) for i in range(n)])
+def _tone(ms, amp=8000, hz=440, rate=RATE):
+    n = int(rate * ms / 1000)
+    return struct.pack("<%dh" % n, *[int(amp * math.sin(2 * math.pi * hz * i / rate)) for i in range(n)])
 
 
-def _silence(ms=600):
-    return b"\x00" * int(24000 * ms / 1000) * 2
+def _silence(ms=600, rate=RATE):
+    return b"\x00" * int(rate * ms / 1000) * 2
 
 
 def test_silence_yields_nothing():
@@ -78,6 +81,64 @@ def test_speech_text_cleaned():
     long = "Sentence one. " + "x" * 2000
     assert len(_clean_for_speech(long)) <= speech.MAX_SYNTH_CHARS + 1
     assert _clean_for_speech("   ") == ""
+
+
+def _dominant_hz(pcm, rate):
+    import struct as _st
+
+    n = len(pcm) // 2
+    samples = [s / 32768.0 for (s,) in _st.iter_unpack("<h", pcm[: n * 2])]
+    # zero-crossing estimate (fine for a pure test tone)
+    crossings = sum(1 for a, b in zip(samples, samples[1:]) if (a < 0) != (b < 0))
+    seconds = n / rate
+    return crossings / 2 / seconds if seconds else 0.0
+
+
+def test_resample_48k_to_16k():
+    from voice import TARGET_RATE, resample_pcm
+
+    assert TARGET_RATE == 16000
+    tone48 = _tone(600, rate=48000)
+    out = resample_pcm(tone48, 48000, 16000)
+    assert len(out) == len(tone48) // 3  # exact 3:1 fast path
+    assert abs(_dominant_hz(out, 16000) - 440) < 30  # pitch preserved
+
+
+def test_resample_passthrough_and_empty():
+    from voice import resample_pcm
+
+    tone16 = _tone(200, rate=16000)
+    assert resample_pcm(tone16, 16000, 16000) == tone16
+    assert resample_pcm(b"", 48000, 16000) == b""
+
+
+def test_voice_threads_hidden_and_purged(tmp_path):
+    import asyncio as _asyncio
+
+    from chainlit.types import Pagination, ThreadFilter
+
+    from datalayer import SQLiteDataLayer
+
+    layer = SQLiteDataLayer(tmp_path / "t.db")
+
+    async def go():
+        await layer.update_thread("voice-1", user_id="u", metadata={"is_voice": True})
+        await layer.update_thread("chat-1", user_id="u", metadata={})
+
+    _asyncio.run(go())
+
+    async def listed():
+        page = await layer.list_threads(Pagination(first=10), ThreadFilter(userId="u"))
+        return [t["id"] for t in page.data]
+
+    ids = _asyncio.run(listed())
+    assert "chat-1" in ids and "voice-1" not in ids
+
+    async def purged():
+        return await layer.purge_voice_threads()
+
+    assert _asyncio.run(purged()) == 1
+    assert _asyncio.run(listed()) == ["chat-1"]
 
 
 def test_ephemeral_skips_memory():
