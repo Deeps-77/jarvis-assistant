@@ -238,7 +238,11 @@ class WorkspaceRegistry:
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or Path(__file__).parent.parent / "code_workspaces.json"
+        if path is None:
+            from paths import code_workspaces_file
+
+            path = code_workspaces_file()
+        self.path = path
         self._lock = threading.Lock()
         self._entries: list[SavedWorkspace] = []
         self._load()

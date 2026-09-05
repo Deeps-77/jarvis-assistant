@@ -136,11 +136,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 import botlog
 import core
 from datalayer import SQLiteDataLayer
+from paths import chat_threads_db, documents_dir, memory_db
 
 
 @cl.data_layer
 def get_data_layer():
-    return SQLiteDataLayer(Path(__file__).parent / "chat_threads.db")
+    return SQLiteDataLayer(chat_threads_db())
 
 AUDIO_UPLOADS = {".oga", ".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
 SAMPLE_RATE = 24000
@@ -197,11 +198,10 @@ def ensure_setup():
     global setup_done
     if not setup_done:
         core.load_histories()
-        base = Path(__file__).parent
-        core.init_memory(base / "memory.db")
-        core.init_docs(base / "memory.db")
+        core.init_memory(memory_db())
+        core.init_docs(memory_db())
         core.init_speech()
-        (base / "documents").mkdir(exist_ok=True)
+        documents_dir().mkdir(exist_ok=True)
         setup_done = True
 
 

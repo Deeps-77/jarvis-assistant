@@ -22,7 +22,8 @@ from langchain_ollama import ChatOllama
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 from memory import FactExtractor, MemoryStore
-from tools import (
+from paths import chat_history_file
+from chat_tools import (
     date_calculator,
     get_crypto_price,
     get_current_time,
@@ -52,7 +53,7 @@ def load_env_file(env_path: Path | None = None):
 load_env_file()
 
 MODEL_NAME = os.environ.get("OLLAMA_MODEL", "hf.co/LiquidAI/LFM2.5-2.6B-GGUF:latest")
-HISTORY_FILE = Path(__file__).parent / "chat_history.json"
+HISTORY_FILE = chat_history_file()
 
 SYSTEM_PROMPT = """You are Jarvis, a personal AI assistant.
 Identity rules:
@@ -87,7 +88,7 @@ def init_docs(db_path: Path):
     global doc_store
     try:
         from docs import DocStore
-        from tools import set_doc_store
+        from chat_tools import set_doc_store
 
         store = DocStore(db_path)
         doc_store = store

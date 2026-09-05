@@ -183,16 +183,33 @@ Or set it permanently in `.env`. Any Ollama model with tool-calling support work
 ```
 main.py                Telegram adapter: handlers, auth, markdown→HTML pipeline
 app.py                 Chainlit web UI adapter (password auth, file/audio uploads, mic STT route)
-code_ui.py             Chainlit code-assistant adapter (workspace + chat sessions, mode, streaming, approval gate)
+code_ui.py             Thin entry shim → code_ui/ package (run: python code_ui.py, :8500)
+code_ui/               Code-assistant frontend, one module per concern:
+  bootstrap.py         paths/env/secrets/logging/shared constants (import first)
+  state.py             per-browser-session state (workspace, brain, tracker, chat)
+  workspace_ui.py      workspace picker + file-tree browsing + native dialog
+  sessions_ui.py       chat-session picker/activate/persist/replay + callbacks
+  commands.py          all 13 slash commands
+  approval.py          approval-gate cards and outcome chips
+  chrome.py            welcome card, sidebar status, typing-area settings panel
+  lifecycle.py         auth, chat start/message loop, settings updates, main()
 core.py                backend-agnostic chat agent brain (shared by all chat frontends)
+chat_tools.py          nine chat tools (search + live facts + document RAG)
+paths.py               central runtime paths (data/ with legacy fallback + auto-migrate)
 code_assistant/        code-assistant brain + tools (read + write + approval)
   workspace.py         Workspace model + path validation + saved-workspaces registry
   tools.py             LangChain @tool functions (read + write + exec; mode-gated)
   modes.py             Plan/Build mode enum + tool gating + system prompts
-  brain.py             CodeBrain manual ReAct loop with approval gate, streams BrainEvents
+  brain.py             CodeBrain manual ReAct loop: approval gate, thinking
+                       stream, invalid-call repair, empty-round nudge
   sessions.py          Per-workspace chat sessions (save/resume/rename/delete, JSON registry)
   config.py            Optional code_assistant.yaml harness config loader
   sandbox.py           subprocess sandbox: env strip, timeout, output cap, copy_out
+tests/                 pytest suite (mocked, no Ollama needed): sessions,
+                       token purge/rehydrate, brain streaming, paths migration
+transcripts/           assistant session transcripts (local only, gitignored)
+data/                  runtime data (DBs, registries, documents; auto-migrated
+                       from root on first run, gitignored)
 tools.py               nine chat tools (search + live facts + document RAG)
 llm_provider.py        Ollama + OpenAI provider abstraction (Phase 0)
 token_usage.py         TokenTracker LangChain callback + JSONL persistence (Phase 0)

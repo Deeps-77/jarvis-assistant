@@ -40,10 +40,11 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
 from llm_provider import CODEX_TIER_LABEL, LLMProvider, cloud_equivalent_cost_usd, estimate_cost_usd
+from paths import LOG_DIR
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOG_PATH = Path(__file__).parent / "logs" / "code_tokens.jsonl"
+DEFAULT_LOG_PATH = LOG_DIR / "code_tokens.jsonl"
 
 
 @dataclass(slots=True)

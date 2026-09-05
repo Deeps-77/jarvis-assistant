@@ -4,7 +4,8 @@ import sys
 import time
 from pathlib import Path
 
-LOGS_DIR = Path(__file__).parent / "logs"
+from paths import LOG_DIR as LOGS_DIR
+
 POLL_INTERVAL = 0.5
 
 _COLORS = {

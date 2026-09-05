@@ -1,5 +1,6 @@
 # Python-generated files
 __pycache__/
+*/__pycache__/
 *.py[oc]
 build/
 dist/
@@ -13,6 +14,7 @@ wheels/
 .env
 
 # Local runtime data
+data/
 chat_history.json*
 memory.db*
 logs/
@@ -24,4 +26,7 @@ documents/
 code_workspaces.json
 code_sessions.json
 certs/
+.files/
 chat_threads.db*
+# Assistant session transcripts (kept locally under transcripts/)
+session-*.md

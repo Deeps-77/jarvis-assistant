@@ -35,7 +35,7 @@ from langchain_core.messages import BaseMessage, messages_from_dict, messages_to
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SESSIONS_PATH = Path(__file__).parent.parent / "code_sessions.json"
+DEFAULT_SESSIONS_PATH = Path(__file__).parent.parent / "data" / "code_sessions.json"
 
 #: Max saved chats per workspace; oldest pruned beyond this.
 MAX_SESSIONS_PER_WORKSPACE = 20
@@ -111,7 +111,11 @@ class SessionStore:
         path: Path | None = None,
         max_per_workspace: int = MAX_SESSIONS_PER_WORKSPACE,
     ) -> None:
-        self.path = path or DEFAULT_SESSIONS_PATH
+        if path is None:
+            from paths import code_sessions_file
+
+            path = code_sessions_file()
+        self.path = path
         self.max_per_workspace = max(1, max_per_workspace)
         self._lock = threading.Lock()
         self._data: dict[str, list[ChatSession]] = {}

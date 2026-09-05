@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import botlog
 import core
 from core import MODEL_NAME, TOOLBELT, setup_logging
+from paths import LOG_DIR, documents_dir, memory_db
 from langchain_core.messages import AIMessage, HumanMessage
 from markdown_it import MarkdownIt
 from telegram import Update
@@ -19,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 MAX_MESSAGE_LEN = 4096
 TG_CHUNK_LIMIT = 4000
-DOCUMENTS_DIR = Path(__file__).parent / "documents"
+DOCUMENTS_DIR = documents_dir()
 SUPPORTED_UPLOADS = {".pdf", ".docx", ".txt", ".md"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
@@ -415,7 +416,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0] if context.args else "").strip()
     limit = min(int(arg), 50) if arg.isdigit() and int(arg) > 0 else 15
 
-    log_path = Path(__file__).parent / "logs" / "activity.log"
+    log_path = LOG_DIR / "activity.log"
     if not log_path.exists():
         await update.effective_message.reply_text("No activity recorded yet.")
         return
@@ -696,8 +697,8 @@ def main():
         logger.warning("ALLOWED_TELEGRAM_IDS is empty - the bot is open to ANYONE")
 
     core.load_histories()
-    core.init_memory(Path(__file__).parent / "memory.db")
-    core.init_docs(Path(__file__).parent / "memory.db")
+    core.init_memory(memory_db())
+    core.init_docs(memory_db())
     core.init_speech()
     DOCUMENTS_DIR.mkdir(exist_ok=True)
 

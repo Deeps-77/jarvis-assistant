@@ -6,7 +6,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-LOGS_DIR = Path(__file__).parent / "logs"
+from paths import LOG_DIR as LOGS_DIR
 ACTIVITY_FILE = LOGS_DIR / "activity.log"
 DIAG_FILE = LOGS_DIR / "jarvis.log"
 EVENTS_FILE = LOGS_DIR / "events.jsonl"
