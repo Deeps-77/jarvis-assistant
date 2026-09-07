@@ -37,12 +37,15 @@ def _args(args, scope):
         scope.names.add(args.kwarg.arg)
 
 
+_IMPLICIT_GLOBALS = {"__file__", "__name__", "__package__", "__doc__"}
+
+
 def _visit(node, scope, problems, fname):
     if isinstance(node, ast.Name):
         if isinstance(node.ctx, ast.Store):
             scope.names.add(node.id)
         elif isinstance(node.ctx, ast.Load) and not scope.resolve(node.id):
-            if node.id not in dir(builtins):
+            if node.id not in dir(builtins) and node.id not in _IMPLICIT_GLOBALS:
                 problems.append(f"{fname}:{node.lineno} undefined {node.id!r}")
         return
     for child in ast.iter_child_nodes(node):

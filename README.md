@@ -142,11 +142,30 @@ On each device, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`,
 
 Telegram voice notes and Chainlit audio attachments (or the browser mic button) are transcribed locally by faster-whisper (`WHISPER_MODEL`, default `small`, int8 CPU with automatic CUDA when available — GPU detected on this machine). The transcript is echoed back ("🎤 I heard: …") and then answered through the full pipeline — search, live tools, documents, all of it.
 
-### 🎙️ Voice mode (web UI, ephemeral)
+### 🎙️ Voice console (standalone, ephemeral)
 
-Type `/voice on` (or flip the gear-icon switch) and just talk — mic turns are endpointed automatically, answered through the chat brain, and spoken back via offline Piper TTS. Text keeps working alongside. **Nothing is stored:** voice turns skip vector memory, logs keep counters only (no transcripts), and voice chats are tagged invisible so they never appear in history (orphans purged at startup; best-effort delete on chat end). Mixed sessions keep their text turns; voice words are never logged.
+A separate always-listening voice UI on **http://localhost:8600** (no Chainlit in the loop, so none of its thread/history quirks apply):
 
-Mic audio arrives at device rate (~48kHz) and is resampled server-side to Whisper-native 16kHz — this also fixed the old push-to-talk mic path, which had the same mismatch. Override with `VOICE_INPUT_RATE` if your hardware differs.
+```powershell
+python -m voice_server.server
+```
+
+Tap **Start listening** once, then talk hands-free — mic turns endpoint automatically (energy pre-gate + Silero confirm), answers stream back as speech (sentence-chunked Piper prefetch: next sentence synthesizes while the current plays), and talking over a reply barges in cleanly. Orb + VU meter show live state; a type-fallback box rides the same voice pipeline. **Nothing is stored, by construction:** no threads, no steps, no memory writes — transcripts live only for the active turn, logs keep counters only.
+
+Pipeline (all local): browser 16kHz mic → faster-whisper (`beam_size=1`, pinned `en`) → chat brain, ephemeral session → Piper `--output_raw` streaming synth. One-time setup is the vendored Piper binary + voice under `vendor/piper/` (see below); Silero VAD (~2MB) fetches once, then everything runs offline.
+
+```powershell
+# 1. Engine: piper_windows_amd64.zip from github.com/rhasspy/piper releases
+#    Extract everything into vendor/piper/ (piper.exe + DLLs + espeak-ng-data)
+# 2. Voice: rhasspy/piper-voices → en/en_US/lessac/medium (or high):
+#    en_US-lessac-medium.onnx + en_US-lessac-medium.onnx.json
+#    into vendor/piper/voices/ (json name must match the onnx name exactly)
+# 3. Verify:
+.\vendor\piper\piper.exe --help
+cmd /c "echo Hello test. | vendor\piper\piper.exe --model vendor\piper\voices\en_US-lessac-high.onnx --output_file test.wav --debug"
+```
+
+Tuning knobs (`VOICE_SILENCE_MS`, `VOICE_MIN_SPEECH_MS`, `VOICE_MAX_TURN_MS`, `VOICE_VAD_THRESHOLD`, `VOICE_SILERO_THRESHOLD`, `VOICE_PIPER_*`) are documented in `.env.example`. The Chainlit chat UI keeps classic push-to-talk mic transcription (now with correct 16kHz resampling) — no voice loop lives there anymore.
 
 One-time manual setup (fully offline afterwards):
 
@@ -237,7 +256,10 @@ token_usage.py         TokenTracker LangChain callback + JSONL persistence (Phas
 docs.py                per-user document store (parse, chunk, embed, retrieve)
 memory.py              sqlite-vec long-term conversational memory
 speech.py              whisper STT + Piper offline TTS (vendored binary)
-voice.py               mic VAD turn-taking + ephemeral voice-loop orchestration
+voice.py               mic VAD turn-taking + 16kHz resample utils (shared)
+voice_server/          standalone voice console (:8600): FastAPI + WS server,
+                       Silero-confirmed VAD, streaming STT/LLM/TTS pipeline,
+                       barge-in, static orb/VU-meter UI — no Chainlit involved
 botlog.py              logging setup + human-readable event helpers
 watch_logs.py          colored terminal log follower
 ```

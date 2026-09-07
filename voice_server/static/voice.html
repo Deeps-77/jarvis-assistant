@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jarvis Voice</title>
+  <link rel="stylesheet" href="/static/voice.css">
+</head>
+<body>
+  <main class="console">
+    <header>
+      <span id="conn" class="conn off">● OFFLINE</span>
+      <h1>Jarvis Voice</h1>
+      <span class="ephemeral" title="Nothing spoken is stored anywhere">ephemeral</span>
+    </header>
+
+    <section class="stage">
+      <div id="orb" class="orb idle" aria-live="polite"><span id="orbGlyph">○</span></div>
+      <p id="stateLine" class="state">press Start and talk</p>
+      <p id="liveLine" class="live"></p>
+    </section>
+
+    <section class="vuWrap" aria-hidden="true">
+      <div id="vu" class="vu"><div id="vuFill"></div></div>
+    </section>
+
+    <section class="controls">
+      <button id="btnListen" class="primary">▶ Start listening</button>
+      <button id="btnMute">🔇 Mute speaker</button>
+    </section>
+
+    <details class="history">
+      <summary>Turn history (this session only, never stored)</summary>
+      <div id="turns"></div>
+    </details>
+
+    <section class="fallback">
+      <input id="textIn" type="text" maxlength="2000" placeholder="or type here — you'll still hear the reply…" autocomplete="off">
+      <button id="btnSend">Send</button>
+    </section>
+
+    <section class="tuning">
+      <label>VAD sensitivity
+        <input id="threshold" type="range" min="100" max="3000" step="50" value="500">
+      </label>
+      <span class="voiceTag">voice: en_US-lessac-high · offline</span>
+    </section>
+  </main>
+
+  <script src="/static/voice.js" defer></script>
+</body>
+</html>
