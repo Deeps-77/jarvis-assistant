@@ -142,6 +142,12 @@ def create_app():
                         pass  # client-side only; informational
         except WebSocketDisconnect:
             pass
+        except RuntimeError as e:
+            # Starlette raises this when the browser goes away without a
+            # clean close handshake (tab closed, refresh). Normal churn.
+            if "disconnect" not in str(e).lower():
+                raise
+            logger.debug("voice client disconnected uncleanly; cleaned up")
         except Exception:
             logger.exception("voice socket failed")
         finally:
