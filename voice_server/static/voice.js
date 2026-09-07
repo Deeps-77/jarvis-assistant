@@ -25,6 +25,7 @@
   let playCtx = null;
   let playQueue = [];      // AudioBufferSourceNodes currently scheduled
   let speaking = false;    // server says audio is coming / playing
+  let turnDone = false;    // server finished the turn (reply text received)
   let backoff = 500;
 
   const STATES = {
@@ -96,13 +97,18 @@
         else if (msg.type === 'transcript') {
           // A new turn preempts anything still playing from the last one.
           stopPlayback();
+          turnDone = false;
           setState('endpointing');
           liveLine.textContent = '“' + msg.text + '”';
           addTurn('you', msg.text);
         } else if (msg.type === 'reply') {
           addTurn('jarvis', msg.text);
           liveLine.textContent = '';
-          if (!speaking) setState('listening');
+          turnDone = true;
+          if (!speaking) {
+            turnDone = false;
+            setState('listening');
+          }
         } else if (msg.type === 'error') {
           stateLine.textContent = '⚠️ ' + msg.message;
         }
@@ -134,10 +140,15 @@
     playCursor = Math.max(playCursor, ctx.currentTime + 0.05);
     src.onended = () => {
       playQueue = playQueue.filter((s) => s !== src);
-      if (playQueue.length === 0) speaking = false;
-      // NOTE: no setState here — the server's `reply` message (end of the
-      // turn) is what returns the orb to listening. Otherwise the UI would
-      // flicker between sentences whenever the network jitters.
+      if (playQueue.length === 0) {
+        speaking = false;
+        // Only go idle-listening when the turn itself is done; otherwise
+        // more sentences are still on the way (no flicker between them).
+        if (turnDone) {
+          turnDone = false;
+          setState('listening');
+        }
+      }
     };
     playQueue.push(src);
     speaking = true;
@@ -153,6 +164,7 @@
     }
     playQueue = [];
     speaking = false;
+    turnDone = false; // abandoned audio never completes a turn
     if (playCtx) playCursor = playCtx.currentTime;
   }
 
