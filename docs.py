@@ -133,8 +133,15 @@ class DocStore:
             return {"status": "added", "chunks": len(pieces)}
         except (UnsupportedFormatError, ValueError) as e:
             return {"status": "error", "message": str(e)}
-        except Exception as e:
+        except sqlite3.DatabaseError as e:
+            # Store-level breakage (schema gone, disk I/O, closed handle):
+            # take the store offline until restart.
             self._disable(f"ingest failed: {e}")
+            return {"status": "error", "message": f"indexing failed: {e}"}
+        except Exception as e:
+            # Document-level failure (bad file, embedder hiccup): report it
+            # but stay enabled for the next document.
+            logger.warning("ingest failed for %s: %s", filename, e)
             return {"status": "error", "message": f"indexing failed: {e}"}
 
     def _existing_hash(self, owner: str, filename: str) -> str | None:
@@ -171,7 +178,7 @@ class DocStore:
             ]
             self._conn.executemany(
                 "INSERT INTO doc_chunks(embedding, owner, source, text, chunk_index, ts) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 rows,
             )
             self._conn.commit()
@@ -187,8 +194,11 @@ class DocStore:
         try:
             vec = await asyncio.to_thread(self.embedder.embed_query, query[:2000])
             return await asyncio.to_thread(self._search_sync, owner, vec, k)
-        except Exception as e:
+        except sqlite3.DatabaseError as e:
             self._disable(f"search failed: {e}")
+            return []
+        except Exception as e:
+            logger.warning("search failed: %s", e)
             return []
 
     def _search_sync(self, owner: str, vec: list[float], k: int) -> list[tuple[str, int, str]]:
@@ -207,8 +217,11 @@ class DocStore:
             return "", True
         try:
             return await asyncio.to_thread(self._doc_text_sync, owner, source, cap)
-        except Exception as e:
+        except sqlite3.DatabaseError as e:
             self._disable(f"doc_text failed: {e}")
+            return "", True
+        except Exception as e:
+            logger.warning("doc_text failed: %s", e)
             return "", True
 
     def _doc_text_sync(self, owner: str, source: str, cap: int) -> tuple[str, bool]:
@@ -232,8 +245,11 @@ class DocStore:
             return []
         try:
             return await asyncio.to_thread(self._list_sync, owner)
-        except Exception as e:
+        except sqlite3.DatabaseError as e:
             self._disable(f"list failed: {e}")
+            return []
+        except Exception as e:
+            logger.warning("list failed: %s", e)
             return []
 
     def _list_sync(self, owner: str) -> list[dict]:
