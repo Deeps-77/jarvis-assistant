@@ -32,7 +32,7 @@ async def warmup() -> None:
     if core.speech_transcriber is None or not core.speech_transcriber.enabled:
         return
     try:
-        silence = b"\x00" * 16000 * 2 // 2  # 0.5s of 16kHz silence
+        silence = b"\x00" * (16000 * 2 // 2)  # 0.5s of 16kHz mono int16
         await core.transcribe_audio(wav_bytes(silence), "warmup.wav")
     except Exception:
         logger.exception("stt warmup failed (non-fatal)")
