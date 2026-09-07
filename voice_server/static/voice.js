@@ -94,11 +94,15 @@
         const msg = JSON.parse(ev.data);
         if (msg.type === 'state') setState(msg.state);
         else if (msg.type === 'transcript') {
+          // A new turn preempts anything still playing from the last one.
+          stopPlayback();
+          setState('endpointing');
           liveLine.textContent = '“' + msg.text + '”';
           addTurn('you', msg.text);
         } else if (msg.type === 'reply') {
           addTurn('jarvis', msg.text);
           liveLine.textContent = '';
+          if (!speaking) setState('listening');
         } else if (msg.type === 'error') {
           stateLine.textContent = '⚠️ ' + msg.message;
         }
@@ -116,31 +120,40 @@
     return playCtx;
   }
 
+  let playCursor = 0; // AudioContext time: next sentence starts here or later
+
   async function playWav(buf) {
     const ctx = await ensurePlayCtx();
     const audio = await ctx.decodeAudioData(buf.slice(0));
     const src = ctx.createBufferSource();
     src.buffer = audio;
     src.connect(ctx.destination);
-    speaking = true;
-    setState('speaking');
+    // Sequential scheduling: each sentence starts when the previous ends.
+    // (Firing src.start() immediately was stacking every sentence on top
+    // of each other — the reported overlap.)
+    playCursor = Math.max(playCursor, ctx.currentTime + 0.05);
     src.onended = () => {
       playQueue = playQueue.filter((s) => s !== src);
-      if (playQueue.length === 0 && speaking) {
-        speaking = false;
-        setState('listening');
-      }
+      if (playQueue.length === 0) speaking = false;
+      // NOTE: no setState here — the server's `reply` message (end of the
+      // turn) is what returns the orb to listening. Otherwise the UI would
+      // flicker between sentences whenever the network jitters.
     };
     playQueue.push(src);
-    src.start();
+    speaking = true;
+    setState('speaking');
+    src.start(playCursor);
+    playCursor += audio.duration;
   }
 
   function stopPlayback() {
     for (const src of playQueue) {
       try { src.stop(); } catch (_) { /* already ended */ }
+      try { src.disconnect(); } catch (_) {}
     }
     playQueue = [];
     speaking = false;
+    if (playCtx) playCursor = playCtx.currentTime;
   }
 
   async function startListening() {
