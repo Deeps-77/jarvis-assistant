@@ -24,6 +24,64 @@ DOCUMENTS_DIR = documents_dir()
 SUPPORTED_UPLOADS = {".pdf", ".docx", ".txt", ".md"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
+
+def _respond_timeout() -> float:
+    try:
+        return max(10.0, float(os.environ.get("TELEGRAM_RESPOND_TIMEOUT", "90")))
+    except ValueError:
+        return 90.0
+
+
+def _timeout_text() -> str:
+    return (
+        "⏳ Taking longer than usual — I stopped this attempt "
+        f"({_respond_timeout():.0f}s limit). Please rephrase or try again."
+    )
+
+
+TIMEOUT_MSG = _timeout_text()
+STOPPED_MSG = "⏹️ Stopped the current request."
+NOTHING_RUNNING_MSG = "Nothing running right now."
+ERROR_MSG = "⚠️ Something went wrong on my side. Please try again."
+
+# chat_id -> in-flight handler tasks (text/voice/photo). Commands like
+# /stop and /model bypass this on purpose so they can cancel it.
+_inflight: dict[int, set] = {}
+
+
+def _track_inflight(chat_id: int):
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    if task is None:
+        return None
+    _inflight.setdefault(int(chat_id), set()).add(task)
+    return task
+
+
+def _untrack_inflight(chat_id: int):
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return
+    bucket = _inflight.get(int(chat_id))
+    if not bucket:
+        return
+    bucket.discard(task)
+    if not bucket:
+        _inflight.pop(int(chat_id), None)
+
+
+def _cancel_inflight(chat_id: int) -> int:
+    bucket = _inflight.get(int(chat_id)) or set()
+    count = 0
+    for task in list(bucket):
+        if not task.done():
+            task.cancel()
+            count += 1
+    return count
+
 _md_parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
 
 setup_logging()
@@ -459,11 +517,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     t_start = time.perf_counter()
 
+    _track_inflight(chat_id)
     typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id))
     try:
-        body, footer_sources, failed = await core.respond(
-            str(chat_id), message.text, owner=str(update.effective_user.id)
-        )
+        try:
+            body, footer_sources, failed = await asyncio.wait_for(
+                core.respond(
+                    str(chat_id), message.text, owner=str(update.effective_user.id)
+                ),
+                timeout=_respond_timeout(),
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            await update.effective_message.reply_text(_timeout_text())
+            botlog.log_reply(time.perf_counter() - t_start, 0, "timeout")
+            return
+        except asyncio.CancelledError:
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            botlog.log_reply(time.perf_counter() - t_start, 0, "stopped")
+            try:
+                await update.effective_message.reply_text(STOPPED_MSG)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            logger.exception("Chat respond failed")
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            await update.effective_message.reply_text(ERROR_MSG)
+            botlog.log_reply(time.perf_counter() - t_start, 0, "error")
+            return
         await send_html_reply(update, body, footer_sources)
         botlog.log_reply(
             time.perf_counter() - t_start,
@@ -472,6 +557,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         typing_task.cancel()
+        _untrack_inflight(chat_id)
         await asyncio.to_thread(core.save_histories)
 
 
@@ -534,6 +620,123 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     botlog.log_command("stats", _user_name(update), user_id)
     await update.effective_message.reply_text(botlog.get_stats())
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        botlog.log_denied(_user_name(update), update.effective_user.id)
+        await update.effective_message.reply_text(denial_text(update))
+        return
+    botlog.log_command("stop", _user_name(update), update.effective_user.id)
+    cancelled = _cancel_inflight(update.effective_chat.id)
+    if cancelled:
+        await update.effective_message.reply_text("⏹️ Stopping the current request...")
+    else:
+        await update.effective_message.reply_text(NOTHING_RUNNING_MSG)
+
+
+def _format_model_size(size: int) -> str:
+    if size <= 0:
+        return "?"
+    gb = size / (1024**3)
+    if gb >= 1:
+        return f"{gb:.1f}GB"
+    return f"{size / (1024**2):.0f}MB"
+
+
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if owner_id is None or user_id != owner_id:
+        botlog.log_denied(_user_name(update), user_id)
+        await update.effective_message.reply_text(
+            "⛔ /models is restricted to the bot owner."
+        )
+        return
+    botlog.log_command("models", _user_name(update), user_id)
+    try:
+        models = await core.list_ollama_models()
+    except Exception as e:
+        logger.warning("Ollama model list failed: %s", e)
+        await update.effective_message.reply_text(
+            "⚠️ Ollama is unavailable right now (is `ollama serve` running?)."
+        )
+        return
+    if not models:
+        await update.effective_message.reply_text(
+            "No local models found. Pull one with `ollama pull <name>`."
+        )
+        return
+    current = core.MODEL_NAME
+    lines = [f"🧠 Current: `{current}`", "", "Available:"]
+    for m in sorted(models, key=lambda x: x["name"]):
+        star = "⭐ " if m["name"] == current else ""
+        lines.append(f"{star}`{m['name']}` ({_format_model_size(m['size'])})")
+    lines.append("")
+    lines.append("Switch with: `/model <exact-name>`")
+    text = "\n".join(lines)
+    if len(text) > TG_CHUNK_LIMIT:
+        text = text[: TG_CHUNK_LIMIT - 20] + "\n…(truncated)"
+    try:
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest:
+        await update.effective_message.reply_text(text)
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if owner_id is None or user_id != owner_id:
+        botlog.log_denied(_user_name(update), user_id)
+        await update.effective_message.reply_text(
+            "⛔ /model is restricted to the bot owner."
+        )
+        return
+    botlog.log_command("model", _user_name(update), user_id)
+    target = " ".join(context.args or []).strip()
+    if not target:
+        await update.effective_message.reply_text(
+            f"🧠 Current: `{core.MODEL_NAME}`\nUsage: `/model <exact-name>` (see /models)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        models = await core.list_ollama_models()
+    except Exception as e:
+        logger.warning("Ollama model list failed: %s", e)
+        await update.effective_message.reply_text(
+            "⚠️ Ollama is unavailable right now (is `ollama serve` running?)."
+        )
+        return
+    names = {m["name"] for m in models}
+    if target not in names:
+        hint = "\n".join(f"• `{n}`" for n in sorted(names)[:20])
+        await update.effective_message.reply_text(
+            f"⚠️ Unknown model `{target}`.\n\nAvailable:\n{hint}\n\n"
+            f"Pull more with `ollama pull <name>`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if target == core.MODEL_NAME:
+        await update.effective_message.reply_text(f"Already on `{target}`.")
+        return
+    # Stop any running generation first so VRAM is free for the swap.
+    _cancel_inflight(update.effective_chat.id)
+    await update.effective_message.reply_text(f"🔄 Switching to `{target}`...")
+    try:
+        old = await asyncio.wait_for(
+            core.set_chat_model(target), timeout=_respond_timeout()
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        await update.effective_message.reply_text(
+            "⚠️ Switch timed out — Ollama may still be loading. Check /models."
+        )
+        return
+    except Exception as e:
+        logger.exception("Model switch failed")
+        await update.effective_message.reply_text(f"⚠️ Switch failed: {e}")
+        return
+    await update.effective_message.reply_text(
+        f"✅ Switched `{old}` → `{target}` (old model unloaded)."
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,16 +808,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_name(update), user_id, _chat_desc(update), f"🖼️ photo {caption}".strip() or "🖼️ photo"
     )
 
-    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id := update.effective_chat.id))
+    _track_inflight(chat_id := update.effective_chat.id)
+    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id))
     t_start = time.perf_counter()
     try:
-        biggest = msg.photo[-1]
-        tg_file = await biggest.get_file()
-        raw = bytes(await tg_file.download_as_bytearray())
-        question = caption or "Describe this image in detail."
-        body, failed = await core.vision_respond(
-            str(chat_id), str(user_id), raw, "jpeg", question
-        )
+        try:
+            biggest = msg.photo[-1]
+            tg_file = await biggest.get_file()
+            raw = bytes(await tg_file.download_as_bytearray())
+            question = caption or "Describe this image in detail."
+            body, failed = await asyncio.wait_for(
+                core.vision_respond(
+                    str(chat_id), str(user_id), raw, "jpeg", question
+                ),
+                timeout=_respond_timeout(),
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            await update.effective_message.reply_text(_timeout_text())
+            botlog.log_reply(time.perf_counter() - t_start, 0, "timeout")
+            return
+        except asyncio.CancelledError:
+            botlog.log_reply(time.perf_counter() - t_start, 0, "stopped")
+            try:
+                await update.effective_message.reply_text(STOPPED_MSG)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            logger.exception("Vision respond failed")
+            await update.effective_message.reply_text(ERROR_MSG)
+            botlog.log_reply(time.perf_counter() - t_start, 0, "error")
+            return
         await send_html_reply(update, body)
         botlog.log_reply(
             time.perf_counter() - t_start,
@@ -623,6 +847,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         typing_task.cancel()
+        _untrack_inflight(chat_id)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -641,25 +866,54 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     botlog.log_user_msg(_user_name(update), user_id, _chat_desc(update), "🎤 voice message")
     t_start = time.perf_counter()
 
-    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id := update.effective_chat.id))
+    _track_inflight(chat_id := update.effective_chat.id)
+    typing_task = asyncio.create_task(typing_indicator(context.bot, chat_id))
     try:
-        tg_file = await audio.get_file()
-        raw = bytes(await tg_file.download_as_bytearray())
-
-        transcript = await core.transcribe_audio(raw, fname)
-        if not transcript:
-            await update.effective_message.reply_text(
-                "🎤 I couldn't make out any speech in that message. Try again a bit closer to the mic?"
-            )
-            return
-
-        echo = f"🎤 I heard: {_esc(transcript[:400])}"
         try:
-            await update.effective_message.reply_text(echo, parse_mode=ParseMode.HTML)
-        except BadRequest:
-            await update.effective_message.reply_text(f"🎤 I heard: {transcript[:400]}")
+            tg_file = await audio.get_file()
+            raw = bytes(await tg_file.download_as_bytearray())
 
-        body, footer_sources, failed = await core.respond(str(chat_id), transcript, owner=str(user_id))
+            transcript = await asyncio.wait_for(
+                core.transcribe_audio(raw, fname), timeout=_respond_timeout()
+            )
+            if not transcript:
+                await update.effective_message.reply_text(
+                    "🎤 I couldn't make out any speech in that message. Try again a bit closer to the mic?"
+                )
+                return
+
+            echo = f"🎤 I heard: {_esc(transcript[:400])}"
+            try:
+                await update.effective_message.reply_text(echo, parse_mode=ParseMode.HTML)
+            except BadRequest:
+                await update.effective_message.reply_text(f"🎤 I heard: {transcript[:400]}")
+
+            body, footer_sources, failed = await asyncio.wait_for(
+                core.respond(str(chat_id), transcript, owner=str(user_id)),
+                timeout=_respond_timeout(),
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            await update.effective_message.reply_text(_timeout_text())
+            botlog.log_reply(time.perf_counter() - t_start, 0, "timeout")
+            return
+        except asyncio.CancelledError:
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            botlog.log_reply(time.perf_counter() - t_start, 0, "stopped")
+            try:
+                await update.effective_message.reply_text(STOPPED_MSG)
+            except Exception:
+                pass
+            raise
+        except Exception:
+            logger.exception("Voice respond failed")
+            core.pop_last_exchange(str(chat_id))
+            await asyncio.to_thread(core.save_histories)
+            await update.effective_message.reply_text(ERROR_MSG)
+            botlog.log_reply(time.perf_counter() - t_start, 0, "error")
+            return
         await send_html_reply(update, body, footer_sources)
         botlog.log_reply(
             time.perf_counter() - t_start,
@@ -668,6 +922,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         typing_task.cancel()
+        _untrack_inflight(chat_id)
         await asyncio.to_thread(core.save_histories)
 
 
@@ -727,6 +982,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("forget", forget_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("models", models_command))
+    app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("logs", logs_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("docs", docs_command))

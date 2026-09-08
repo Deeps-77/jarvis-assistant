@@ -36,7 +36,10 @@ from chat_tools import (
 )
 
 MAX_HISTORY_MESSAGES = 16
-MAX_TOOL_ROUNDS = 4
+MAX_TOOL_ROUNDS = 3
+OLLAMA_BASE_URL_DEFAULT = "http://localhost:11434"
+MODEL_SWITCH_LIST_TIMEOUT = 10.0
+MODEL_SWITCH_UNLOAD_TIMEOUT = 10.0
 
 
 def load_env_file(env_path: Path | None = None):
@@ -82,6 +85,152 @@ chat_histories: dict[str, list] = {}
 memory_store: MemoryStore | None = None
 doc_store = None
 _background_tasks: set = set()
+_model_lock = asyncio.Lock()
+
+
+def ollama_base_url() -> str:
+    return (
+        os.environ.get("OLLAMA_BASE_URL", "").strip().rstrip("/")
+        or OLLAMA_BASE_URL_DEFAULT
+    )
+
+
+def pop_last_exchange(session_key: str) -> bool:
+    """Remove a dangling user message added before a timeout/cancel.
+
+    ``respond()`` appends the HumanMessage optimistically; if the agent
+    never finishes there is no AIMessage to pair it with. Leaving it
+    would duplicate context on the next retry. Returns True if popped.
+    """
+    history = chat_histories.get(str(session_key))
+    if history and isinstance(history[-1], HumanMessage):
+        history.pop()
+        return True
+    return False
+
+
+async def list_ollama_models() -> list[dict]:
+    """List locally available Ollama models via /api/tags.
+
+    Returns [{"name","size","modified_at"}]. Raises on connection errors
+    so callers can show an "Ollama unavailable" message.
+    """
+    import httpx
+
+    url = f"{ollama_base_url()}/api/tags"
+    async with httpx.AsyncClient(timeout=MODEL_SWITCH_LIST_TIMEOUT) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        payload = r.json()
+    out = []
+    for m in payload.get("models", []) or []:
+        out.append(
+            {
+                "name": str(m.get("name", "")),
+                "size": int(m.get("size", 0) or 0),
+                "modified_at": str(m.get("modified_at", "")),
+            }
+        )
+    return [m for m in out if m["name"]]
+
+
+async def _unload_ollama_model(model_name: str) -> bool:
+    """Best-effort eviction of one model from Ollama VRAM.
+
+    ``keep_alive: 0`` tells Ollama to unload immediately. Never raises;
+    returns False when the unload could not be confirmed.
+    """
+    import httpx
+
+    name = (model_name or "").strip()
+    if not name:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=MODEL_SWITCH_UNLOAD_TIMEOUT) as client:
+            r = await client.post(
+                f"{ollama_base_url()}/api/generate",
+                json={"model": name, "keep_alive": 0},
+            )
+            # Ollama answers 200 with a short generation; any 2xx counts.
+            return 200 <= r.status_code < 300
+    except Exception:
+        logger.debug("Ollama unload of %r failed", name, exc_info=True)
+        return False
+
+
+def persist_ollama_model_env(model_name: str) -> Path:
+    """Atomically persist OLLAMA_MODEL=<name> to the project .env.
+
+    Preserves comments, ordering, and other keys. Appends the key when
+    missing. Returns the .env path written.
+    """
+    env_path = Path(__file__).parent / ".env"
+    name = (model_name or "").strip()
+    if not name:
+        raise ValueError("model name must not be empty")
+    lines: list[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key_part = stripped
+        if key_part.lower().startswith("export "):
+            key_part = key_part[7:].strip()
+        key, _, _ = key_part.partition("=")
+        if key.strip() == "OLLAMA_MODEL":
+            prefix = line[: len(line) - len(line.lstrip())]
+            lines[i] = f"{prefix}OLLAMA_MODEL={name}"
+            found = True
+            break
+    if not found:
+        lines.append(f"OLLAMA_MODEL={name}")
+    tmp = env_path.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(env_path)
+    os.environ["OLLAMA_MODEL"] = name
+    return env_path
+
+
+async def set_chat_model(model_name: str) -> str:
+    """Hot-swap the chat brain to another local Ollama model.
+
+    Rebuilds ``llm`` + ``agent`` (and the memory extractor when it
+    reuses the main model), persists ``.env``, then unloads the old
+    model from VRAM. Serialized by ``_model_lock``. Returns old name.
+    """
+    global MODEL_NAME, llm, agent
+    name = (model_name or "").strip()
+    if not name:
+        raise ValueError("model name must not be empty")
+    async with _model_lock:
+        old = MODEL_NAME
+        if name == old:
+            return old
+        new_llm = ChatOllama(**_chat_llm_kwargs(name))
+        new_agent = create_react_agent(new_llm, tools=TOOLBELT)
+        MODEL_NAME = name
+        llm = new_llm
+        agent = new_agent
+        # Memory extractor reuses the chat model unless explicitly pinned.
+        try:
+            pinned = os.environ.get("MEMORY_EXTRACT_MODEL", "").strip()
+            if not pinned and memory_store is not None and memory_store.extractor is not None:
+                extract_llm = ChatOllama(
+                    model=name, temperature=0.0, num_ctx=8192, timeout=180, keep_alive=-1
+                )
+                memory_store.extractor._llm = extract_llm
+        except Exception:
+            logger.warning("Memory extractor rebuild failed; keeping old extractor", exc_info=True)
+        try:
+            persist_ollama_model_env(name)
+        except Exception:
+            logger.exception("Failed to persist OLLAMA_MODEL to .env")
+        unloaded = await _unload_ollama_model(old)
+        logger.info("Model switch %r -> %r (old unloaded: %s)", old, name, unloaded)
+        return old
 
 
 def init_docs(db_path: Path):
@@ -228,7 +377,27 @@ def clear_session(session_key: str):
     save_histories()
 
 
-llm = ChatOllama(model=MODEL_NAME, temperature=0.2, num_ctx=8192, timeout=600, keep_alive=-1)
+def _chat_llm_kwargs(model: str, **overrides) -> dict:
+    """Build ChatOllama kwargs for a chat model.
+
+    Small 2B-class models (e.g. MiniCPM) drift into repetition loops when
+    driving the tool-calling agent, so a mild repeat penalty is applied
+    for them. Larger models are left at the Ollama default.
+    """
+    kwargs: dict = dict(
+        model=model,
+        temperature=0.2,
+        num_ctx=8192,
+        timeout=600,
+        keep_alive=-1,
+    )
+    if "minicpm" in (model or "").lower():
+        kwargs["repeat_penalty"] = 1.1
+    kwargs.update(overrides)
+    return kwargs
+
+
+llm = ChatOllama(**_chat_llm_kwargs(MODEL_NAME))
 
 VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "granite3.2-vision:2b")
 VISION_KEEP_ALIVE = os.environ.get("OLLAMA_VISION_KEEP_ALIVE", "10m")

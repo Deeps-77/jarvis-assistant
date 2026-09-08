@@ -16,6 +16,8 @@ No cloud AI APIs. No per-token costs. Your conversations never leave your hardwa
 - ⚡ **Live token streaming** in the web UI — answers appear as they're generated; tool-chatter is retracted so only the final answer stays
 - 📝 **Native formatting** — the model's GitHub-flavored Markdown is converted to proper Telegram HTML (headings, lists, code blocks, tables, clickable source links); the web UI renders full Markdown directly
 - 🛡️ **Anti-hallucination guardrails** — per-turn date grounding, output sanity gate, tool-round caps with forced grounding, "say you don't know" instructions
+- ⏱️ **Reply deadline + `/stop`** — every Telegram answer is bounded (default 90s: timeout sends an apology instead of leaving you on "typing…" forever); `/stop` cancels the in-flight request
+- 🔄 **Runtime model switching** — owner-only `/models` lists local Ollama models, `/model <name>` hot-swaps the chat brain, persists to `.env`, and unloads the old model from VRAM
 - 👥 **Allowlist access control** — only people you approve can talk to it; first allowlisted ID is the owner
 - 📊 **Human-readable logs** — emoji-rich daily log files, a colored terminal tail, and a `/logs` command for the owner
 
@@ -84,7 +86,9 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | *(required)* | token from @BotFather |
 | `ALLOWED_TELEGRAM_IDS` | *(empty = open to anyone)* | comma-separated allowlist; **first ID = owner** |
-| `OLLAMA_MODEL` | LFM2.5-2.6B GGUF | any tool-calling chat model in `ollama list` |
+| `OLLAMA_MODEL` | LFM2.5-2.6B GGUF | any tool-calling chat model in `ollama list` (switch at runtime with `/model`) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama host for chat + `/models` listing |
+| `TELEGRAM_RESPOND_TIMEOUT` | `90` | reply deadline in seconds (min 10); timeout sends an apology, `/stop` cancels early |
 | `EMBED_MODEL` | `nomic-embed-text` | embedding model behind long-term memory |
 | `MEMORY_TOP_K` | `4` | max recalled facts per query |
 | `MEMORY_MIN_SIMILARITY` | `0.55` | cosine floor for recall (empirically tuned) |
@@ -101,6 +105,9 @@ Don't know your Telegram ID? Message the bot once — unauthorized users get a r
 | `/start` | allowed users | start a fresh conversation |
 | `/reset` | allowed users | clear the current chat window |
 | `/forget` | allowed users | clear the window **and** long-term memory |
+| `/stop` | allowed users | cancel the in-flight request in this chat |
+| `/models` | owner only | list local Ollama models (⭐ marks the active one) |
+| `/model <name>` | owner only | hot-swap the chat brain, persist to `.env`, unload the old model |
 | `/docs` | allowed users | list your uploaded documents |
 | `/logs [n]` | owner only | last n activity lines sent as a message |
 
@@ -197,9 +204,20 @@ Log files land in `logs/`, rotate at midnight, and are kept for 30 days. Written
 | `logs/jarvis.log` | full diagnostics with timestamps |
 | `logs/events.jsonl` | machine-readable event stream (one JSON per event) |
 
-**Usage analytics**: the owner can send `/stats` anytime for a same-day summary (messages per user, replies, voice notes, top tools, documents, gated failures). Stats are rebuilt from `events.jsonl`, so they survive restarts.
+**Usage analytics**: the owner can send `/stats` anytime for a same-day summary (messages per user, replies broken down into gated/timeout/stopped, voice notes, top tools, documents). Stats are rebuilt from `events.jsonl`, so they survive restarts.
 
 ## 🔄 Swapping models
+
+No restart needed — the owner can switch from Telegram:
+
+```
+/models              # list local models, ⭐ marks the active one
+/model phi4-mini:latest
+```
+
+`/model` validates against the live Ollama list (unknown names are rejected with an `ollama pull` hint), persists `OLLAMA_MODEL` to `.env`, rebuilds the agent (plus the memory extractor when it reuses the main model), and evicts the old model from VRAM (`keep_alive: 0`).
+
+Or set it before launch:
 
 ```bash
 # PowerShell
@@ -209,7 +227,7 @@ $env:OLLAMA_MODEL="phi4-mini:latest"; python main.py
 OLLAMA_MODEL=phi4-mini:latest python main.py
 ```
 
-Or set it permanently in `.env`. Any Ollama model with tool-calling support works; smaller models (≤3B) vary in how reliably they follow instructions.
+Any Ollama model with tool-calling support works; smaller models (≤3B) vary in how reliably they follow instructions. Every Telegram reply is bounded by `TELEGRAM_RESPOND_TIMEOUT` (default 90s) — a stuck generation is cancelled with an apology instead of hanging on "typing…", and `/stop` cancels it on demand.
 
 ## 🔒 Security & privacy notes
 
@@ -246,7 +264,10 @@ code_assistant/        code-assistant brain + tools (read + write + approval)
   config.py            Optional code_assistant.yaml harness config loader
   sandbox.py           subprocess sandbox: env strip, timeout, output cap, copy_out
 tests/                 pytest suite (mocked, no Ollama needed): sessions,
-                       token purge/rehydrate, brain streaming, paths migration
+                       token purge/rehydrate, brain streaming, paths migration,
+                       telegram timeout/stop tracking, model switch/unload.
+                       test_minicpm_toolcall.py is a manual live-Ollama
+                       benchmark script (run directly, not part of pytest).
 transcripts/           assistant session transcripts (local only, gitignored)
 data/                  runtime data (DBs, registries, documents; auto-migrated
                        from root on first run, gitignored)
@@ -576,7 +597,7 @@ via `llm:` block if needed.
 
 ## 🧪 Known limits
 
-- Small (≤3B) models vary in instruction-following: persona discipline, tool choice, and hallucination resistance improve with larger models.
+- Small (≤3B) models vary in instruction-following: persona discipline, tool choice, and hallucination resistance improve with larger models. MiniCPM-class models get two targeted guards — `repeat_penalty=1.1` (auto-applied by name, including via `/model` hot-swap) and a 3-round tool cap — against repetition loops and runaway agent rounds.
 - Weather/FX/crypto rely on free keyless services — occasional throttling degrades gracefully instead of inventing numbers.
 
 ## 📄 License

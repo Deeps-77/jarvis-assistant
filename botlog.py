@@ -41,13 +41,23 @@ class _BenignSocketResetFilter(logging.Filter):
         return True
 
 
+_CONFIGURED = False
+
+
 def setup_logging() -> None:
+    global _CONFIGURED
     LOGS_DIR.mkdir(exist_ok=True)
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for handler in list(root.handlers):
         root.removeHandler(handler)
+    for handler in list(_activity.handlers):
+        _activity.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(
@@ -74,6 +84,8 @@ def setup_logging() -> None:
 
     for noisy in ("httpx", "primp", "uvicorn.access", "uvicorn.error", "chainlit"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    _CONFIGURED = True
 
 
 def _jsonl(event: str, **fields) -> None:
@@ -165,7 +177,7 @@ def get_stats() -> str:
     date = datetime.now().strftime("%Y-%m-%d")
     per_user: dict[str, int] = {}
     voice = 0
-    replies = gated = docs_added = docs_dedup = denied = commands = 0
+    replies = gated = timeouts = stopped = docs_added = docs_dedup = denied = commands = 0
     tools: Counter = Counter()
 
     if EVENTS_FILE.exists():
@@ -184,7 +196,12 @@ def get_stats() -> str:
                     voice += 1
             elif ev == "reply":
                 replies += 1
-                if rec.get("status") != "ok":
+                status = rec.get("status")
+                if status == "timeout":
+                    timeouts += 1
+                elif status == "stopped":
+                    stopped += 1
+                elif status != "ok":
                     gated += 1
             elif ev == "tools":
                 for t in rec.get("tools", []):
@@ -204,7 +221,10 @@ def get_stats() -> str:
         out.append(
             "👤 " + " · ".join(f"{u}: {c} msgs" for u, c in sorted(per_user.items(), key=lambda x: -x[1]))
         )
-    out.append(f"💬 Replies: {replies} ({gated} gated) · 🎤 Voice notes: {voice}")
+    out.append(
+        f"💬 Replies: {replies} ({gated} gated, {timeouts} timeout, {stopped} stopped)"
+        f" · 🎤 Voice notes: {voice}"
+    )
     if tools:
         top = ", ".join(f"{t} x{c}" for t, c in tools.most_common(5))
         out.append(f"🔧 Tools: {top}")
