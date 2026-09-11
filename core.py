@@ -430,6 +430,100 @@ TOOLBELT = [
 
 agent = create_react_agent(llm, tools=TOOLBELT)
 
+# Chat modes for frontends with a mode picker (web UI gear panel).
+# Telegram/voice call respond() without a mode and get "normal".
+CHAT_MODES = ("normal", "quick", "research", "docs")
+DEFAULT_CHAT_MODE = os.environ.get("CHAT_DEFAULT_MODE", "normal").strip().lower()
+if DEFAULT_CHAT_MODE not in CHAT_MODES:
+    DEFAULT_CHAT_MODE = "normal"
+
+DOC_TOOL_NAMES = frozenset({"search_documents", "summarize_document", "list_documents"})
+
+MODE_PROMPT_SUFFIX = {
+    "normal": "",
+    "quick": (
+        "\n\nQUICK MODE: answer directly from your own knowledge. "
+        "Do NOT call any tools — no web search, no documents, no calculators. "
+        "If you genuinely don't know, say so in one line."
+    ),
+    "research": (
+        "\n\nRESEARCH MODE: fresh web results were retrieved just now and are "
+        "included below — treat their dates as authoritative. Answer using "
+        "those results and cite sources like [1][2]. When figures disagree "
+        "across dates, present them as a range-with-dates and name the event "
+        "that changed things. If the results look stale or don't contain the "
+        "answer, say so explicitly instead of guessing."
+    ),
+    "docs": (
+        "\n\nDOCUMENTS MODE: answer ONLY from the user's uploaded documents "
+        "using search_documents / summarize_document / list_documents. NEVER "
+        "call web_search or any live-fact tool. If the documents don't "
+        "contain the answer, say so explicitly instead of guessing."
+    ),
+}
+
+
+def normalize_chat_mode(raw: str | None) -> str:
+    mode = (raw or "").strip().lower()
+    return mode if mode in CHAT_MODES else "normal"
+
+
+def _tools_for_mode(mode: str) -> list | None:
+    """Tool subset for a mode. None = full belt (normal/research)."""
+    if mode == "docs":
+        return [t for t in TOOLBELT if t.name in DOC_TOOL_NAMES]
+    return None
+
+
+async def _mandatory_presearch(query: str) -> tuple[str, list[str]]:
+    """Guaranteed ≥1 web search for research mode, bypassing model routing.
+
+    Runs the query verbatim plus a freshness variant (current month/year),
+    merges both, and returns (context_text, urls). Never raises — on total
+    failure returns ("", []) and the turn proceeds labeled unverified.
+    """
+    now_label = datetime.now().astimezone().strftime("%B %Y")
+    queries = [query, f"{query} {now_label}"]
+    chunks: list[str] = []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        try:
+            out = await web_search.ainvoke({"query": q})
+        except Exception:
+            logger.debug("research pre-search failed for %r", q, exc_info=True)
+            continue
+        text = content_to_str(getattr(out, "content", out) or "")
+        if not text or text.startswith("ERROR"):
+            continue
+        chunks.append(text)
+        for url in re.findall(r"URL: (\S+)", text):
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    if not chunks:
+        return "", []
+    context = (
+        "Fresh web research (retrieved just now — trust these dates over "
+        "older knowledge):\n\n" + "\n\n".join(chunks)
+    )
+    return context, urls
+
+
+async def _run_direct(messages: list, on_token=None) -> str:
+    """Single direct model call, no tools. Streams tokens when asked."""
+    if on_token is None:
+        resp = await llm.ainvoke(messages)
+        return content_to_str(resp.content)
+    parts: list[str] = []
+    async for chunk in llm.astream(messages):
+        delta = content_to_str(chunk.content)
+        if delta:
+            parts.append(delta)
+            await on_token(delta)
+    return "".join(parts)
+
+
 FORCE_FINAL_PROMPT = (
     "Stop searching. Write your final answer NOW using ONLY the information you "
     "already gathered above. Cite sources like [1][2]. If something could not be "
@@ -451,21 +545,23 @@ async def run_agent(
     owner: str | None = None,
     on_token=None,
     on_retry=None,
+    tools=None,
 ) -> tuple[str, list[str]]:
+    active_agent = agent if tools is None else create_react_agent(llm, tools=tools)
     generated: list = []
     config = {"recursion_limit": MAX_TOOL_ROUNDS * 2 + 4}
     if owner:
         config["configurable"] = {"doc_owner": str(owner)}
     try:
         if on_token is None:
-            async for update in agent.astream({"messages": messages}, config=config):
+            async for update in active_agent.astream({"messages": messages}, config=config):
                 for node_output in update.values():
                     if isinstance(node_output, list):
                         generated.extend(node_output)
                     elif isinstance(node_output, dict) and "messages" in node_output:
                         generated.extend(node_output["messages"])
         else:
-            await _run_agent_streaming(messages, config, generated, on_token, on_retry)
+            await _run_agent_streaming(messages, config, generated, on_token, on_retry, active_agent)
         botlog.log_tools(_tool_names(generated))
         if not generated:
             return "", []
@@ -486,7 +582,7 @@ async def run_agent(
         return "".join(parts), extract_sources(generated)
 
 
-async def _run_agent_streaming(messages: list, config: dict, generated: list, on_token, on_retry):
+async def _run_agent_streaming(messages: list, config: dict, generated: list, on_token, on_retry, active_agent=None):
     """Drive the agent, forwarding final-answer tokens to the UI as they arrive.
 
     Each model generation is streamed live. When a generation ends in tool
@@ -494,8 +590,9 @@ async def _run_agent_streaming(messages: list, config: dict, generated: list, on
     retract that partial content before the next tool round and the real
     answer streams into a clean slate.
     """
+    active_agent = active_agent or agent
     partial: list[str] = []
-    async for event in agent.astream_events({"messages": messages}, config=config, version="v2"):
+    async for event in active_agent.astream_events({"messages": messages}, config=config, version="v2"):
         kind = event.get("event")
         data = event.get("data") or {}
         if kind == "on_chat_model_stream":
@@ -591,9 +688,14 @@ async def respond(
     on_token=None,
     on_retry=None,
     ephemeral: bool = False,
+    mode: str = "normal",
 ) -> tuple[str, list[str], bool]:
     """Drive one chat turn. When ``ephemeral`` is true (voice mode), the
-    turn skips vector-memory recall AND learning — nothing is retained."""
+    turn skips vector-memory recall AND learning — nothing is retained.
+    ``mode`` is one of normal/quick/research/docs (web UI gear panel);
+    anything else falls back to normal, which is also what Telegram and
+    voice use since they never pass a mode."""
+    mode = normalize_chat_mode(mode)
     history = chat_histories.setdefault(session_key, [])
     history.append(HumanMessage(content=text))
     trim_history(history)
@@ -614,12 +716,36 @@ async def respond(
             )
         logger.debug("memory.recall took %.0fms", (time.perf_counter() - t0) * 1000)
 
-    system_text = f"{SYSTEM_PROMPT}\n\n{preamble}"
+    system_text = f"{SYSTEM_PROMPT}{MODE_PROMPT_SUFFIX.get(mode, '')}\n\n{preamble}"
     agent_messages = [SystemMessage(content=system_text)] + list(history)
 
-    raw_reply, sources = await run_agent(
-        agent_messages, owner=owner, on_token=on_token, on_retry=on_retry
-    )
+    if mode == "quick":
+        raw_reply, sources = await _run_direct(agent_messages, on_token), []
+    else:
+        extra_sources: list[str] = []
+        if mode == "research":
+            # Mandatory search, enforced mechanically (not prompt-only) so
+            # even tool-shy small models can't skip it.
+            presearch_text, extra_sources = await _mandatory_presearch(text)
+            if presearch_text:
+                agent_messages = agent_messages + [
+                    SystemMessage(content=presearch_text)
+                ]
+            else:
+                logger.warning("Research pre-search returned nothing; answering unverified")
+        raw_reply, sources = await run_agent(
+            agent_messages,
+            owner=owner,
+            on_token=on_token,
+            on_retry=on_retry,
+            tools=_tools_for_mode(mode),
+        )
+        # Pre-search URLs first (freshest), then agent sources, deduped.
+        merged = list(extra_sources)
+        for url in sources:
+            if url not in merged:
+                merged.append(url)
+        sources = merged
     reply_md = enforce_identity(sanitize(raw_reply))
     sources = sources[:5]
 

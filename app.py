@@ -130,6 +130,7 @@ os.environ.setdefault(
 )
 
 import chainlit as cl
+from chainlit.input_widget import Select
 from chainlit.types import ThreadDict
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -330,9 +331,90 @@ async def handle_attachments(elements) -> tuple[list[str], list[str], list[tuple
     return confirmations, transcripts, images
 
 
+def _current_chat_mode() -> str:
+    return core.normalize_chat_mode(
+        cl.user_session.get("chat_mode") or core.DEFAULT_CHAT_MODE
+    )
+
+
+async def _model_choices() -> list[str]:
+    """Live Ollama model names, cached per browser session."""
+    cached = cl.user_session.get("model_names")
+    if cached:
+        return list(cached)
+    try:
+        names = [m["name"] for m in await core.list_ollama_models()]
+    except Exception:
+        names = []
+    if not names:
+        names = [core.MODEL_NAME]
+    if core.MODEL_NAME not in names:
+        names = [core.MODEL_NAME] + names
+    cl.user_session.set("model_names", names)
+    return names
+
+
+async def _push_chat_settings() -> None:
+    """Sync the composer gear panel: Model + Mode selects."""
+    try:
+        models = await _model_choices()
+        current_model = core.MODEL_NAME
+        mode = _current_chat_mode()
+        await cl.ChatSettings(
+            inputs=[
+                Select(
+                    id="model",
+                    label="Model",
+                    values=models,
+                    initial_index=models.index(current_model)
+                    if current_model in models
+                    else 0,
+                    description="Shared brain — switching affects all frontends",
+                ),
+                Select(
+                    id="chat_mode",
+                    label="Mode",
+                    values=["normal", "quick", "research", "docs"],
+                    initial_index=["normal", "quick", "research", "docs"].index(mode),
+                    description=(
+                        "normal = full tools · quick = direct, no tools · "
+                        "research = web search mandatory · docs = your files only"
+                    ),
+                ),
+            ]
+        ).send()
+    except Exception:
+        pass
+
+
+@cl.on_settings_update
+async def on_settings_update(settings: dict) -> None:
+    """Gear-panel changed — apply model and/or mode like a command."""
+    settings = settings or {}
+    if "chat_mode" in settings:
+        new_mode = core.normalize_chat_mode(str(settings.get("chat_mode")))
+        if new_mode != _current_chat_mode():
+            cl.user_session.set("chat_mode", new_mode)
+            await cl.Message(content=f"Mode set to **{new_mode}**.").send()
+    if "model" in settings:
+        target = str(settings.get("model") or "").strip()
+        if target and target != core.MODEL_NAME:
+            prog = cl.Message(content=f"🔄 Switching to `{target}`…")
+            await prog.send()
+            try:
+                old = await core.set_chat_model(target)
+                prog.content = f"✅ Switched `{old}` → `{target}`."
+            except Exception as e:
+                prog.content = f"⚠️ Switch failed: {e}"
+            await prog.update()
+            cl.user_session.set("model_names", None)
+            await _push_chat_settings()
+
+
 @cl.on_chat_start
 async def on_chat_start():
     ensure_setup()
+    cl.user_session.set("chat_mode", core.DEFAULT_CHAT_MODE)
     await cl.Message(
         content=(
             f"Hello! I'm Jarvis, running locally on this machine.\n\n"
@@ -341,10 +423,13 @@ async def on_chat_start():
             f"- Attach an **image** and I'll analyze it.\n"
             f"- Type `list my documents` to see what's indexed.\n"
             f"- Your past conversations appear in the sidebar — click to resume.\n"
+            f"- ⚙️ Gear icon by the message box: switch **Model** or **Mode** "
+            f"(normal / quick / research / docs).\n"
             f"- 🎙 Prefer talking? Open the voice console "
             f"(`python -m voice_server.server`, port 8600) — always-listening, offline."
         )
     ).send()
+    await _push_chat_settings()
 
 
 @cl.on_chat_resume
@@ -352,9 +437,12 @@ async def on_chat_resume(thread: "ThreadDict"):
     ensure_setup()
     thread_id = thread["id"]
     cl.user_session.set("session_key", f"thread:{thread_id}")
+    if not cl.user_session.get("chat_mode"):
+        cl.user_session.set("chat_mode", core.DEFAULT_CHAT_MODE)
 
     history = _rebuild_history_from_steps(thread.get("steps"))
     core.chat_histories[f"thread:{thread_id}"] = history
+    await _push_chat_settings()
 
 
 @cl.on_message
@@ -391,10 +479,10 @@ async def on_message(message: cl.Message):
     preview = text if kind == "text" else " ".join(transcripts)
     botlog.log_user_msg(owner, "-", "web UI", preview, kind=kind)
 
-    await _respond_and_send(text)
+    await _respond_and_send(text, _current_chat_mode())
 
 
-async def _respond_and_send(text: str):
+async def _respond_and_send(text: str, mode: str = "normal"):
     answer_msg = cl.Message(content="")
     await answer_msg.send()
     streamed: list[str] = []
@@ -413,7 +501,12 @@ async def _respond_and_send(text: str):
     t0 = time.perf_counter()
     try:
         body, sources, failed = await core.respond(
-            session_key(), text, owner=_username(), on_token=on_token, on_retry=on_retry
+            session_key(),
+            text,
+            owner=_username(),
+            on_token=on_token,
+            on_retry=on_retry,
+            mode=mode,
         )
     except Exception as e:
         botlog.log_error_note(f"{type(e).__name__}: {str(e)[:200]}")
