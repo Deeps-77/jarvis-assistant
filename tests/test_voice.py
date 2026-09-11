@@ -52,6 +52,45 @@ def test_mic_bump_dropped():
     assert t.feed(_silence()) is None  # < min_speech_ms
 
 
+def test_dripped_worklet_chunks_endpoint():
+    """Regression: 128-sample browser worklet drips (256B @16kHz) must endpoint.
+
+    The :8600 console used to feed these straight into whole-frame energy
+    math, so every message yielded zero frames and speech never started.
+    """
+    t = VoiceTurnTaker(_cfg(input_rate=16000, silence_ms=300, min_speech_ms=200))
+    tone = _tone(600, rate=16000)
+    for i in range(0, len(tone), 256):
+        assert t.feed(tone[i : i + 256]) is None  # still speaking
+    assert t.speech_ms > 0
+    silence = _silence(600, rate=16000)
+    utterance = None
+    for i in range(0, len(silence), 256):
+        utterance = t.feed(silence[i : i + 256])
+        if utterance is not None:
+            break
+    assert utterance and len(utterance) > 0
+
+
+def test_sub_frame_remainder_carries_over():
+    t = VoiceTurnTaker(_cfg(input_rate=16000, silence_ms=300, min_speech_ms=200))
+    tone = _tone(600, rate=16000)
+    # Awkward sizes that never align to 960B frames on their own.
+    assert t.feed(tone[:500]) is None
+    assert t.feed(tone[500:1000]) is None
+    assert t.speech_ms > 0  # a full frame formed across the boundary
+    assert t.feed(tone[1000:]) is None
+    assert t.feed(_silence(600, rate=16000))
+
+
+def test_dripped_silence_yields_nothing():
+    t = VoiceTurnTaker(_cfg(input_rate=16000, silence_ms=300, min_speech_ms=200))
+    silence = _silence(600, rate=16000)
+    for i in range(0, len(silence), 256):
+        assert t.feed(silence[i : i + 256]) is None
+    assert t.flush() is None
+
+
 def test_max_turn_force_cuts():
     t = VoiceTurnTaker(_cfg(max_turn_ms=900))
     u = t.feed(_tone(1500))

@@ -177,6 +177,11 @@ class VoiceTurnTaker:
     def __init__(self, config: VoiceConfig | None = None) -> None:
         self.config = config or VoiceConfig.from_env()
         self._buf = bytearray()
+        # Sub-frame carryover: mic sources (e.g. the 128-sample browser
+        # worklet blocks) deliver chunks smaller than one energy frame.
+        # Without buffering, such drips never form a whole frame and speech
+        # is never detected, so they accumulate here until framable.
+        self._pending = bytearray()
         self._speech_ms = 0
         self._silence_ms = 0
         self._in_speech = False
@@ -189,8 +194,13 @@ class VoiceTurnTaker:
     def has_pending_speech(self) -> bool:
         return self._in_speech or self._speech_ms > 0
 
+    @property
+    def speech_ms(self) -> int:
+        return self._speech_ms
+
     def reset(self) -> None:
         del self._buf[:]
+        del self._pending[:]
         self._speech_ms = 0
         self._silence_ms = 0
         self._in_speech = False
@@ -202,23 +212,35 @@ class VoiceTurnTaker:
     def feed(self, pcm: bytes) -> bytes | None:
         """Consume mic audio. Returns a finished utterance, else None."""
         cfg = self.config
-        for energy in self._frame_energies(pcm):
-            if energy >= cfg.threshold:
-                self._in_speech = True
-                self._speech_ms += cfg.frame_ms
-                self._silence_ms = 0
-            elif self._in_speech:
-                self._silence_ms += cfg.frame_ms
-        if self._in_speech:
-            # Buffer at whole-chunk granularity; a little leading/trailing
-            # padding is harmless for transcription.
-            self._buf.extend(pcm)
-            total_ms = self._speech_ms + self._silence_ms
-            if self._silence_ms >= cfg.silence_ms or total_ms >= cfg.max_turn_ms:
-                return self._finish()
+        if pcm:
+            self._pending.extend(pcm)
+        size = self.frame_bytes
+        framed = (len(self._pending) // size) * size
+        if framed:
+            chunk = bytes(self._pending[:framed])
+            del self._pending[:framed]
+            for energy in self._frame_energies(chunk):
+                if energy >= cfg.threshold:
+                    self._in_speech = True
+                    self._speech_ms += cfg.frame_ms
+                    self._silence_ms = 0
+                elif self._in_speech:
+                    self._silence_ms += cfg.frame_ms
+            if self._in_speech:
+                # Buffer at whole-frame granularity; a little leading/trailing
+                # padding is harmless for transcription.
+                self._buf.extend(chunk)
+                total_ms = self._speech_ms + self._silence_ms
+                if self._silence_ms >= cfg.silence_ms or total_ms >= cfg.max_turn_ms:
+                    return self._finish()
         return None
 
     def _finish(self) -> bytes | None:
+        # Fold any sub-frame tail (<30ms) into the utterance; negligible for
+        # transcription but keeps no audio behind on endpoint/flush.
+        if self._pending:
+            self._buf.extend(self._pending)
+            del self._pending[:]
         utterance = bytes(self._buf)
         speech_ms = self._speech_ms
         self.reset()

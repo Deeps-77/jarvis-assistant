@@ -157,7 +157,7 @@ A separate always-listening voice UI on **http://localhost:8600** (no Chainlit i
 python -m voice_server.server
 ```
 
-Tap **Start listening** once, then talk hands-free — mic turns endpoint automatically (energy pre-gate + Silero confirm), answers stream back as speech (sentence-chunked Piper prefetch: next sentence synthesizes while the current plays), and talking over a reply barges in cleanly. Orb + VU meter show live state; a type-fallback box rides the same voice pipeline. **Nothing is stored, by construction:** no threads, no steps, no memory writes — transcripts live only for the active turn, logs keep counters only.
+Tap **Start listening** once, then talk hands-free — mic turns endpoint automatically (energy pre-gate + Silero confirm), answers stream back as speech (sentence-chunked Piper prefetch: next sentence synthesizes while the current plays), and talking over a reply barges in cleanly. Orb + VU meter show live state (a "🎙️ hearing you…" heartbeat confirms speech is registering before the turn endpoints); the threshold slider retunes the VAD energy gate live if your mic needs it; a type-fallback box rides the same voice pipeline. **Nothing is stored, by construction:** no threads, no steps, no memory writes — transcripts live only for the active turn, logs keep counters only.
 
 Pipeline (all local): browser 16kHz mic → faster-whisper (`beam_size=1`, pinned `en`) → chat brain, ephemeral session → Piper `--output_raw` streaming synth. One-time setup is the vendored Piper binary + voice under `vendor/piper/` (see below); Silero VAD (~2MB) fetches once, then everything runs offline.
 

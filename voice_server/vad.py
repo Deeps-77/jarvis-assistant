@@ -87,6 +87,20 @@ class VoiceEndpoint:
     def has_pending_speech(self) -> bool:
         return self._taker.has_pending_speech
 
+    @property
+    def pending_ms(self) -> int:
+        return self._taker.speech_ms
+
+    def set_threshold(self, value: float) -> float:
+        """Live-tune the energy gate (e.g. from the console slider)."""
+        try:
+            tuned = float(value)
+        except (TypeError, ValueError):
+            return self._taker.config.threshold
+        tuned = min(5000.0, max(50.0, tuned))
+        self._taker.config.threshold = tuned
+        return tuned
+
     def _checked(self, candidate: bytes | None) -> bytes | None:
         if not candidate:
             return None

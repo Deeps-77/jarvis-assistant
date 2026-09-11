@@ -168,6 +168,94 @@ def test_ws_full_turn_mp(monkeypatch):
         assert got_reply
 
 
+def test_set_threshold_clamps():
+    from voice_server import vad as vad_mod
+    from voice import VoiceConfig, VoiceTurnTaker
+
+    ep = vad_mod.VoiceEndpoint(VoiceTurnTaker(VoiceConfig(input_rate=16000)))
+    assert ep.set_threshold(800) == 800
+    assert ep.set_threshold(999999) == 5000.0
+    assert ep.set_threshold(1) == 50.0
+    assert ep.set_threshold("bogus") == 50.0  # invalid input keeps current
+
+
+def test_ws_dripped_audio_endpoints(monkeypatch):
+    """Full WS turn with 256B drips, exactly as the Chrome worklet sends."""
+    import json
+
+    client = _ws_client(monkeypatch)
+    with client.websocket_connect("/ws/voice") as ws:
+        assert ws.receive_json()["type"] == "state"
+        ws.send_json({"type": "start"})
+        assert ws.receive_json() == {"type": "state", "state": "listening"}
+        tone = _tone_16k(800)
+        for i in range(0, len(tone), 256):
+            ws.send_bytes(tone[i : i + 256])
+        silence = _silence_16k(300)
+        for _ in range(6):
+            ws.send_bytes(silence)
+        got_audio, got_reply = False, False
+        for _ in range(40):
+            msg = ws.receive()
+            if "bytes" in msg:
+                got_audio = True
+            else:
+                data = json.loads(msg["text"])
+                if data["type"] == "reply":
+                    got_reply = True
+                    assert "Hi there" in data["text"]
+                    break
+        assert got_audio, "no audio frames received"
+        assert got_reply, "no reply received for dripped audio"
+
+
+def test_stop_flushes_and_keeps_connection(monkeypatch):
+    """Stop pauses the mic but the socket, turns and text box survive."""
+    import json
+
+    client = _ws_client(monkeypatch)
+    with client.websocket_connect("/ws/voice") as ws:
+        ws.receive_json()  # idle
+        ws.send_json({"type": "start"})
+        assert ws.receive_json() == {"type": "state", "state": "listening"}
+        # Speak without trailing silence, then stop: the partial turn must
+        # still be transcribed, answered, and heard — on this same socket.
+        tone = _tone_16k(800)
+        for i in range(0, len(tone), 256):
+            ws.send_bytes(tone[i : i + 256])
+        ws.send_json({"type": "stop"})
+        kinds = []
+        got_audio, got_reply, got_idle = False, False, False
+        for _ in range(40):
+            msg = ws.receive()
+            if "bytes" in msg:
+                got_audio = True
+                continue
+            data = json.loads(msg["text"])
+            kinds.append(data["type"])
+            if data["type"] == "reply" and "Hi there" in data["text"]:
+                got_reply = True
+            if data["type"] == "state" and data.get("state") == "idle":
+                got_idle = True
+            if got_reply and got_idle:
+                break
+        assert got_reply, f"flushed turn never answered, saw {kinds}"
+        assert got_audio, "flushed turn produced no audio"
+        assert got_idle, f"never returned to idle, saw {kinds}"
+        # Connection still alive: text requests work after stop.
+        ws.send_json({"type": "text", "text": "still here?"})
+        kinds = []
+        for _ in range(30):
+            msg = ws.receive()
+            if "bytes" in msg:
+                continue
+            data = json.loads(msg["text"])
+            kinds.append(data["type"])
+            if data["type"] == "reply":
+                break
+        assert "reply" in kinds, kinds
+
+
 def test_ws_barge_and_text(monkeypatch):
     client = _ws_client(monkeypatch)
     with client.websocket_connect("/ws/voice") as ws:

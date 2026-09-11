@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -103,6 +104,7 @@ def create_app():
             return ag
 
         await send(server_msg("state", state="idle"))
+        last_partial = 0.0
         try:
             while True:
                 packet = await ws.receive()
@@ -118,6 +120,15 @@ def create_app():
                             agent().start_turn(text)
                         else:
                             await send(server_msg("state", state="listening"))
+                    elif endpoint.has_pending_speech:
+                        # Throttled "hearing you" heartbeat so a working-but-
+                        # not-yet-endpointed mic is distinguishable from dead.
+                        now = time.monotonic()
+                        if now - last_partial >= 0.5:
+                            last_partial = now
+                            await send(
+                                server_msg("partial", speechMs=endpoint.pending_ms)
+                            )
                 elif "text" in packet and packet["text"] is not None:
                     try:
                         msg = json.loads(packet["text"])
@@ -127,8 +138,25 @@ def create_app():
                     if kind == "start":
                         endpoint.reset()
                         await send(server_msg("state", state="listening"))
+                    elif kind == "threshold":
+                        tuned = endpoint.set_threshold(msg.get("value"))
+                        logger.debug("VAD threshold tuned to %.0f", tuned)
                     elif kind == "stop":
-                        break
+                        # Pause listening, keep the session alive: flush
+                        # trailing speech (no 1s silence yet) as a normal
+                        # fire-and-forget turn so its reply/audio still
+                        # arrive, then report idle. The socket stays open —
+                        # only a real disconnect tears down (see finally).
+                        utterance = endpoint.flush()
+                        endpoint.reset()
+                        if utterance:
+                            text = await transcribe_utterance(
+                                wav_bytes(utterance), "utterance.wav"
+                            )
+                            if text and len(text.strip()) >= 2:
+                                await send(server_msg("transcript", text=text[:1000]))
+                                agent().start_turn(text)
+                        await send(server_msg("state", state="idle"))
                     elif kind == "barge":
                         ag = agent_holder.get("agent")
                         if ag is not None:

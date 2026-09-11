@@ -85,9 +85,11 @@
       conn.textContent = '● OFFLINE';
       conn.className = 'conn off';
       stopPlayback();
+      // The socket is long-lived by design (only the mic toggles), so an
+      // unexpected drop always reconnects; mic resumes only if listening.
       setTimeout(() => {
         backoff = Math.min(backoff * 2, 8000);
-        if (listening) connect();
+        connect();
       }, backoff);
     };
     ws.onmessage = async (ev) => {
@@ -101,6 +103,8 @@
           setState('endpointing');
           liveLine.textContent = '“' + msg.text + '”';
           addTurn('you', msg.text);
+        }         else if (msg.type === 'partial') {
+          liveLine.textContent = '🎙️ hearing you…';
         } else if (msg.type === 'reply') {
           addTurn('jarvis', msg.text);
           liveLine.textContent = '';
@@ -185,16 +189,46 @@
     const worklet = new AudioWorkletNode(audioCtx, 'mic-capture');
     src.connect(analyser);
     src.connect(worklet);
-    worklet.port.onmessage = (e) => {
+    // Batch ~12 worklet blocks (~96ms) per WS frame: the server VAD needs
+    // whole 30ms energy frames, and 8ms drips also waste ~125 msgs/sec.
+    let micBatch = [];
+    const BATCH_BLOCKS = 12;
+    const flushMicBatch = () => {
+      if (!micBatch.length) return;
+      let total = 0;
+      for (const b of micBatch) total += b.length;
+      const cat = new Float32Array(total);
+      let off = 0;
+      for (const b of micBatch) { cat.set(b, off); off += b.length; }
+      micBatch = [];
       if (ws && ws.readyState === WebSocket.OPEN && listening) {
-        ws.send(floatTo16(e.data));
+        ws.send(floatTo16(cat));
       }
     };
+    window._flushMic = flushMicBatch;
+    worklet.port.onmessage = (e) => {
+      if (!listening) { micBatch = []; return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN) { micBatch = []; return; }
+      micBatch.push(e.data.slice(0));
+      if (micBatch.length >= BATCH_BLOCKS) flushMicBatch();
+    };
+    // Live-tune the server VAD energy gate (debounced). Previously the
+    // slider only affected client-side barge-in sensitivity.
+    let threshTimer = null;
+    threshold.addEventListener('input', () => {
+      clearTimeout(threshTimer);
+      threshTimer = setTimeout(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'threshold', value: Number(threshold.value) }));
+        }
+      }, 300);
+    });
     window._worklet = worklet;
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) connect();
-    else ws.send(JSON.stringify({ type: 'start' }));
     listening = true;
+    if (!ws || ws.readyState === WebSocket.CLOSED) connect();
+    else if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'start' }));
+    // CONNECTING: the onopen handler sends start since listening is true.
     btnListen.textContent = '■ Stop listening';
     btnListen.classList.add('live');
     setState('listening');
@@ -202,8 +236,13 @@
   }
 
   function stopListening() {
+    // Mic toggle only: the socket stays open so in-flight replies keep
+    // playing, the transcript feed keeps arriving, and the text box keeps
+    // working. The server pauses endpointing on "stop" (flushing trailing
+    // speech as a final turn). Use the mute button to hush the speaker.
+    try { if (window._flushMic) window._flushMic(); } catch (_) {}
+    window._flushMic = null;
     listening = false;
-    stopPlayback();
     if (window._worklet) {
       try { window._worklet.port.postMessage({ cmd: 'stop' }); } catch (_) {}
       window._worklet = null;
