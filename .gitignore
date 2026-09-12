@@ -32,3 +32,8 @@ certs/
 chat_threads.db*
 # Assistant session transcripts (kept locally under transcripts/)
 session-*.md
+
+# HUD dev artefacts (never commit)
+.uv-cache/
+.spike-out/
+.hf-cache/

@@ -21,8 +21,9 @@ if (-not $Mode) {
     Write-Host "  3) Code  (code_ui.py - code assistant :8500)"
     Write-Host "  4) Voice (voice console :8600)"
     Write-Host "  5) All   (bot + web + code + voice in separate windows)"
-    $choice = Read-Host "Enter 1-5"
-    $Mode = @{ "1" = "bot"; "2" = "web"; "3" = "code"; "4" = "voice"; "5" = "all" }[$choice]
+    Write-Host "  6) Hud   (hud/app.py - desktop HUD: chat + voice + Tamil)"
+    $choice = Read-Host "Enter 1-6"
+    $Mode = @{ "1" = "bot"; "2" = "web"; "3" = "code"; "4" = "voice"; "5" = "all"; "6" = "hud" }[$choice]
 }
 
 switch ($Mode) {
@@ -30,6 +31,7 @@ switch ($Mode) {
     "web"   { & $py (Join-Path $PROJECT "app.py") }
     "code"  { & $py (Join-Path $PROJECT "code_ui.py") }
     "voice" { & $py "-m" "voice_server.server" }
+    "hud"   { & $py "-m" "hud.app" }
     "both" {
         Start-Process -FilePath $py -ArgumentList "main.py" -WorkingDirectory $PROJECT
         Start-Process -FilePath $py -ArgumentList "app.py"  -WorkingDirectory $PROJECT
