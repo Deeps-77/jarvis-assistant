@@ -475,6 +475,43 @@ def _tools_for_mode(mode: str) -> list | None:
     return None
 
 
+def _match_direct(direct_routes, text: str, owner, belt: list):
+    """First deterministic route hit, or None.
+
+    Each matcher is called as matcher(text, {"owner": owner}) and returns
+    (tool_name, args) | None. The tool is resolved against this turn's
+    belt, so routes can never fire tools that aren't bound. Never raises:
+    a broken matcher is skipped with a warning.
+    """
+    if not direct_routes:
+        return None
+    by_name = {t.name: t for t in belt}
+    context = {"owner": owner}
+    for matcher in direct_routes:
+        try:
+            hit = matcher(text, context)
+        except TypeError:
+            try:
+                hit = matcher(text)
+            except Exception:
+                logger.warning("Direct matcher %r failed", matcher, exc_info=True)
+                continue
+        except Exception:
+            logger.warning("Direct matcher %r failed", matcher, exc_info=True)
+            continue
+        if not hit:
+            continue
+        try:
+            tool_name, args = hit
+        except (TypeError, ValueError):
+            continue
+        tool = by_name.get(tool_name)
+        if tool is None:
+            continue
+        return tool, args or {}
+    return None
+
+
 async def _mandatory_presearch(query: str) -> tuple[str, list[str]]:
     """Guaranteed ≥1 web search for research mode, bypassing model routing.
 
@@ -689,12 +726,21 @@ async def respond(
     on_retry=None,
     ephemeral: bool = False,
     mode: str = "normal",
+    extra_tools=None,
+    direct_routes=None,
 ) -> tuple[str, list[str], bool]:
     """Drive one chat turn. When ``ephemeral`` is true (voice mode), the
     turn skips vector-memory recall AND learning — nothing is retained.
     ``mode`` is one of normal/quick/research/docs (web UI gear panel);
     anything else falls back to normal, which is also what Telegram and
-    voice use since they never pass a mode."""
+    voice use since they never pass a mode. ``extra_tools`` appends
+    caller-local tools (e.g. HUD skills) to this turn's belt only —
+    callers that pass nothing get byte-identical behavior.
+    ``direct_routes`` is a list of matcher(text, context) callables, each
+    returning (tool_name, args) | None. The first hit invokes that belt
+    tool directly, bypassing model tool-choice entirely — for intents weak
+    local models fumble through a big belt (e.g. "remind me…"). History,
+    memory and failure gating downstream are unchanged."""
     mode = normalize_chat_mode(mode)
     history = chat_histories.setdefault(session_key, [])
     history.append(HumanMessage(content=text))
@@ -719,7 +765,22 @@ async def respond(
     system_text = f"{SYSTEM_PROMPT}{MODE_PROMPT_SUFFIX.get(mode, '')}\n\n{preamble}"
     agent_messages = [SystemMessage(content=system_text)] + list(history)
 
-    if mode == "quick":
+    belt = _tools_for_mode(mode)
+    if extra_tools:
+        base = belt if belt is not None else TOOLBELT
+        seen = {t.name for t in base}
+        belt = list(base) + [t for t in extra_tools if t.name not in seen]
+    routed = _match_direct(direct_routes, text, owner, belt if belt is not None else TOOLBELT)
+    if routed is not None:
+        tool, args = routed
+        logger.info("Direct route hit: %s(%s)", tool.name, sorted(args))
+        try:
+            result = await tool.ainvoke(args)
+        except Exception as e:
+            logger.warning("Direct tool %s failed: %s", tool.name, e)
+            result = f"ERROR: {tool.name} failed ({e})."
+        raw_reply, sources = content_to_str(result) if not isinstance(result, str) else result, []
+    elif mode == "quick":
         raw_reply, sources = await _run_direct(agent_messages, on_token), []
     else:
         extra_sources: list[str] = []
@@ -738,7 +799,7 @@ async def respond(
             owner=owner,
             on_token=on_token,
             on_retry=on_retry,
-            tools=_tools_for_mode(mode),
+            tools=belt,
         )
         # Pre-search URLs first (freshest), then agent sources, deduped.
         merged = list(extra_sources)

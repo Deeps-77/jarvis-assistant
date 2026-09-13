@@ -703,7 +703,8 @@ def test_turn_streams_tokens_into_synth(monkeypatch):
     import hud.workers as workers_mod
 
     async def fake_respond(session_key, text, owner=None, on_token=None,
-                           on_retry=None, ephemeral=False, mode="normal"):
+                           on_retry=None, ephemeral=False, mode="normal",
+                           extra_tools=None, **kw):
         for tok in ["Hello there. ", "How are you? "]:
             await on_token(tok)
         return "Hello there. How are you?", [], False

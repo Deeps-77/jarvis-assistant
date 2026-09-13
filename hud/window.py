@@ -43,6 +43,62 @@ from .workers import MicWorker, TurnWorker
 logger = logging.getLogger(__name__)
 
 
+class ScreenGrabber(QObject):
+    """Screenshot helper living on the GUI thread.
+
+    Tools run on worker threads, but screen capture must happen on the GUI
+    thread. ``grab()`` round-trips via a queued signal and blocks the
+    caller (with timeout) until the pixels arrive.
+    """
+
+    _asked = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._box: dict = {}
+        self._done = None
+        self._asked.connect(self._do_grab)
+
+    def grab(self, timeout: float = 10.0) -> bytes | None:
+        import threading
+
+        from PyQt6.QtCore import QThread
+
+        if QThread.currentThread() is self.thread():
+            return self._capture()
+        self._box.clear()
+        self._done = threading.Event()
+        self._asked.emit()
+        if not self._done.wait(timeout):
+            return None
+        return self._box.get("png")
+
+    def _do_grab(self) -> None:
+        try:
+            self._box["png"] = self._capture()
+        except Exception:
+            logger.exception("screen grab failed")
+        finally:
+            if self._done is not None:
+                self._done.set()
+
+    @staticmethod
+    def _capture() -> bytes | None:
+        from PyQt6.QtCore import QBuffer, QIODevice
+        from PyQt6.QtWidgets import QApplication
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return None
+        pixmap = screen.grabWindow(0)
+        if pixmap.isNull():
+            return None
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        pixmap.save(buf, "PNG")
+        return bytes(buf.data())
+
+
 class OrbWidget(QWidget):
     """Animated persona orb: halo + spinning rings + particles + waveform."""
 
@@ -368,6 +424,11 @@ class MainWindow(QMainWindow):
         self.test_btn.setToolTip("Probe mic + speaker, report plain-English results")
         self.test_btn.clicked.connect(self._on_self_test)
         tune.addWidget(self.test_btn)
+        self.skills_check = QPushButton("🔌 Skills: off", self)
+        self.skills_check.setCheckable(True)
+        self.skills_check.setToolTip("Arm system skills (open apps, wallpaper, reminders)")
+        self.skills_check.toggled.connect(self._on_skills_toggled)
+        tune.addWidget(self.skills_check)
         self.cam_btn = QPushButton("📷 Camera: off", self)
         self.cam_btn.setCheckable(True)
         self.cam_btn.toggled.connect(self._on_camera_toggled)
@@ -398,12 +459,72 @@ class MainWindow(QMainWindow):
         self.player.errorOccurred.connect(self._on_player_error)
 
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
-        
+
         from PyQt6.QtGui import QShortcut, QKeySequence
         QShortcut(QKeySequence("Space"), self, activated=self._on_shortcut_space)
         QShortcut(QKeySequence("Esc"), self, activated=self._on_shortcut_esc)
-        
+
+        # HUD skill packs (automation) + GUI-thread providers for tools.
+        from hud.skills import load_skills, set_provider, set_system_armed
+
+        for skill in load_skills().values():
+            logger.debug("skill ready: %s [%s]", skill.name, skill.risk)
+        set_system_armed(self.skills_check.isChecked())
+        self._grabber = ScreenGrabber(self)
+        set_provider("screen_grabber", self._grabber.grab)
+        set_provider("on_goodbye", self._request_goodbye)
+
         self._set_state("idle")
+
+    def _on_skills_toggled(self, on: bool) -> None:
+        from hud.skills import set_system_armed
+
+        set_system_armed(on)
+        self.skills_check.setText("🔌 Skills: on" if on else "🔌 Skills: off")
+        self._say(
+            "Jarvis",
+            "_System skills armed — I can open apps, change wallpaper and set reminders (asking first)._"
+            if on else
+            "_System skills off — automation tools parked._",
+        )
+
+    def _grab_screen(self, timeout: float = 10.0) -> bytes | None:
+        """Capture the primary screen as PNG bytes, from any thread."""
+        return self._grabber.grab(timeout=timeout)
+
+    def _request_goodbye(self) -> None:
+        import threading
+
+        from PyQt6.QtWidgets import QApplication
+
+        self._say("Jarvis", "_Closing in a few seconds — goodbye!_")
+
+        def _quit():
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.quit()
+                except Exception:
+                    pass
+
+        threading.Timer(12.0, _quit).start()
+
+    def _request_goodbye(self) -> None:
+        import threading
+
+        from PyQt6.QtWidgets import QApplication
+
+        self._say("Jarvis", "_Closing in a few seconds — goodbye!_")
+
+        def _quit():
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.quit()
+                except Exception:
+                    pass
+
+        threading.Timer(12.0, _quit).start()
 
     # ------------------------------------------------------------ UI state
 

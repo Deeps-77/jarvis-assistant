@@ -194,6 +194,13 @@ class TurnWorker(QObject):
 
         t0 = _time.perf_counter()
         logger.info("HUD turn start (lang=%s, mode=%s)", self._lang, self._mode)
+        from hud.skills import direct_routes, set_turn_context, turn_tools
+
+        skill_tools = turn_tools()
+        skill_routes = direct_routes()
+        if skill_tools:
+            logger.info("HUD turn with %d skill tools", len(skill_tools))
+        set_turn_context(chat_key=self._chat_key, owner="hud")
         route = decide(self._lang)
         self.state.emit("thinking")
         if needs_multilingual_model(self._lang, core.MODEL_NAME):
@@ -223,6 +230,8 @@ class TurnWorker(QObject):
                 owner="hud",
                 on_token=on_token,
                 mode=self._mode,
+                extra_tools=skill_tools,
+                direct_routes=skill_routes,
             )
             logger.info(
                 "HUD respond done in %.1fs (failed=%s, streamed=%d chars)",
@@ -234,6 +243,9 @@ class TurnWorker(QObject):
             await synth.feed_token(body)
         finally:
             await synth.drain()
+            from hud.skills import set_turn_context as _clear_context
+
+            _clear_context()
         full = "".join(streamed).strip() or body
         logger.info("HUD turn finished in %.1fs", _time.perf_counter() - t0)
         self.reply.emit(full)
