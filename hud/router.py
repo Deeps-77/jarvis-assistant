@@ -16,7 +16,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 TAMIL_VOICE = "ta-IN-ValluvarNeural"
-TAMIL_MODEL_HINTS = ("qwen",)
+# Measured Sep 2026 on this machine (Tamil math/poem/tool probes):
+# gemma-4-E2B-it > qwen3.5:2b on fluency and correctness, so gemma first.
+TAMIL_MODEL_HINTS = ("gemma", "qwen")
 
 
 def decide(lang: str, current_model: str = "") -> dict:
@@ -44,7 +46,10 @@ def needs_multilingual_model(lang: str, current_model: str) -> bool:
 
 
 async def suggest_tamil_model() -> str | None:
-    """First installed Qwen model name, or None when none is local."""
+    """Best installed Tamil-capable model, or None when none is local.
+
+    Hint order is preference order (gemma before qwen, measured).
+    """
     try:
         import core
 
@@ -52,10 +57,11 @@ async def suggest_tamil_model() -> str | None:
     except Exception:
         logger.debug("model list for Tamil routing failed", exc_info=True)
         return None
-    for m in models:
-        name = m.get("name", "")
-        if any(hint in name.lower() for hint in TAMIL_MODEL_HINTS):
-            return name
+    names = [m.get("name", "") for m in models]
+    for hint in TAMIL_MODEL_HINTS:
+        for name in names:
+            if hint in name.lower():
+                return name
     return None
 
 

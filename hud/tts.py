@@ -19,6 +19,29 @@ TAMIL_VOICE_EDGE = "ta-IN-ValluvarNeural"  # EdgeTTS Tamil voice (owner choice)
 
 # Kokoro pipelines are ~330 MB each — build once, reuse forever.
 _KOKORO_PIPELINES: dict[str, object] = {}
+
+
+def kokoro_ready() -> bool:
+    """True once any Kokoro pipeline is built (startup warmup or first use)."""
+    return bool(_KOKORO_PIPELINES)
+
+
+async def warmup_kokoro() -> bool:
+    """Build the English pipeline now so sentence one is already warm.
+
+    Safe to call repeatedly; non-fatal by contract (tiers cover absence).
+    Returns True when a pipeline is ready afterwards.
+    """
+    if kokoro_ready():
+        return True
+    try:
+        out = await _kokoro_synthesize("warmup.", "en")
+    except Exception:
+        logger.debug("HUD Kokoro warmup raised", exc_info=True)
+        return False
+    ready = kokoro_ready() and bool(out)
+    logger.info("HUD Kokoro warmup %s", "done" if ready else "unavailable")
+    return ready
 # Kokoro 0.9 lang codes (NOT BCP-47): a=US-en, b=UK-en, e=es, f=fr-fr,
 # h=hi, i=it, p=pt-br, j=ja, z=zh.
 _KOKORO_LANGS = {"en": "a", "hi": "h", "es": "e", "fr": "f", "it": "i",
@@ -99,8 +122,14 @@ async def _kokoro_synthesize(text: str, lang: str = "en-us") -> bytes | None:
         key = _KOKORO_LANGS.get((lang or "en")[:2].lower(), "a")
         pipeline = _KOKORO_PIPELINES.get(key)
         if pipeline is None:
-            logger.info("HUD Kokoro: loading pipeline (%s)…", key)
-            pipeline = await asyncio.to_thread(KPipeline, lang_code=key)
+            # CPU-pinned on purpose: on 4GB VRAM the GPU is already shared by
+            # whisper-CUDA and Ollama, and CUDA Kokoro is only ~1s faster
+            # per sentence (4.1s vs 5.0s measured). Override via HUD_KOKORO_DEVICE.
+            import os as _os
+
+            device = _os.environ.get("HUD_KOKORO_DEVICE", "").strip() or "cpu"
+            logger.info("HUD Kokoro: loading pipeline (%s, device=%s)…", key, device)
+            pipeline = await asyncio.to_thread(KPipeline, lang_code=key, device=device)
             _KOKORO_PIPELINES[key] = pipeline
             logger.info("HUD Kokoro: pipeline ready")
 
@@ -146,34 +175,52 @@ class HudSpeaker:
         self._lock = asyncio.Lock()
 
     async def synthesize(self, text: str, lang: str = "en") -> bytes:
+        import time as _time
+
         clean = (text or "").strip()
         if not clean:
             return b""
+        t0 = _time.perf_counter()
+        lang = (lang or "en").strip().lower() or "en"
+        logger.info("HUD TTS start (lang=%s, %d chars)", lang, len(clean))
 
-        is_tamil = (lang or "").strip().lower().startswith("ta")
+        is_tamil = lang.startswith("ta")
 
         if is_tamil:
             # --- Tamil: EdgeTTS (cloud, Valluvar) ---
             try:
                 result = await self._edge(clean, TAMIL_VOICE_EDGE)
                 if result:
-                    logger.info("HUD TTS: EdgeTTS produced %d bytes (ta)", len(result))
+                    logger.info(
+                        "HUD TTS done: edge %d bytes in %.1fs",
+                        len(result), _time.perf_counter() - t0,
+                    )
                     return result
             except Exception:
                 logger.warning("HUD TTS: EdgeTTS failed, trying Piper", exc_info=True)
             clean = OFFLINE_NOTICE + clean
-        else:
-            # --- English, offline first: Kokoro (best quality, if installed) ---
+        elif kokoro_ready():
+            # --- English, best quality: Kokoro (pipeline already warm) ---
             kokoro_bytes = await _kokoro_synthesize(clean)
             if kokoro_bytes:
-                logger.info("HUD TTS: Kokoro produced %d bytes", len(kokoro_bytes))
+                logger.info(
+                    "HUD TTS done: kokoro %d bytes in %.1fs",
+                    len(kokoro_bytes), _time.perf_counter() - t0,
+                )
                 return kokoro_bytes
+        else:
+            # Cold start: Piper answers in ~3s while Kokoro warms up in the
+            # background. Silence gaps are worse than slightly lower fidelity.
+            logger.info("HUD TTS: kokoro cold — Piper covers until warm")
 
         # --- Piper (offline ONNX, bundled) ---
         try:
             result = await self._piper.synthesize(clean)
             if result:
-                logger.info("HUD TTS: Piper produced %d bytes", len(result))
+                logger.info(
+                    "HUD TTS done: piper %d bytes in %.1fs",
+                    len(result), _time.perf_counter() - t0,
+                )
                 return result
         except Exception:
             logger.warning("HUD TTS: Piper failed, trying pyttsx3", exc_info=True)
@@ -182,11 +229,15 @@ class HudSpeaker:
         try:
             result = await asyncio.to_thread(_pyttsx3_speak_to_wav, clean)
             if result:
-                logger.info("HUD TTS: pyttsx3 produced %d bytes", len(result))
+                logger.info(
+                    "HUD TTS done: pyttsx3 %d bytes in %.1fs",
+                    len(result), _time.perf_counter() - t0,
+                )
                 return result
         except Exception:
             logger.exception("HUD TTS: pyttsx3 failed — all tiers exhausted")
 
+        logger.warning("HUD TTS exhausted all tiers (%.1fs)", _time.perf_counter() - t0)
         return b""
 
     async def _edge(self, text: str, voice: str) -> bytes:
@@ -205,4 +256,4 @@ class HudSpeaker:
                 pass
 
 
-__all__ = ["HudSpeaker", "OFFLINE_NOTICE", "TAMIL_VOICE_EDGE"]
+__all__ = ["HudSpeaker", "OFFLINE_NOTICE", "TAMIL_VOICE_EDGE", "kokoro_ready", "warmup_kokoro"]

@@ -60,6 +60,7 @@ def test_guess_text_lang():
 def test_needs_multilingual_model():
     assert needs_multilingual_model("ta", "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M") is True
     assert needs_multilingual_model("ta", "qwen2.5:7b") is False
+    assert needs_multilingual_model("ta", "hf.co/unsloth/gemma-4-E2B-it-GGUF:Q4_K_M") is False
     assert needs_multilingual_model("en", "MiniCPM") is False
     assert needs_multilingual_model("", "MiniCPM") is False
 
@@ -72,6 +73,13 @@ def test_suggest_tamil_model(monkeypatch):
 
     monkeypatch.setattr(core, "list_ollama_models", fake_list)
     assert asyncio.run(suggest_tamil_model()) == "qwen2.5:7b"
+
+    async def fake_both():
+        # gemma wins over qwen even when listed later (measured better Tamil)
+        return [{"name": "qwen3.5:2b"}, {"name": "gemma-4-E2B-it"}]
+
+    monkeypatch.setattr(core, "list_ollama_models", fake_both)
+    assert asyncio.run(suggest_tamil_model()) == "gemma-4-E2B-it"
 
     async def fake_none():
         return [{"name": "MiniCPM:2b"}]
@@ -112,6 +120,7 @@ def test_hud_speaker_english_offline_chain(monkeypatch):
 
 
 def test_hud_speaker_english_kokoro_first(monkeypatch):
+    """Warm Kokoro serves English; Piper stays quiet on success."""
     from hud import tts as tts_mod
 
     async def fake_kokoro(text, lang="en-us"):
@@ -121,6 +130,7 @@ def test_hud_speaker_english_kokoro_first(monkeypatch):
         raise AssertionError("Piper must not run when Kokoro succeeds")
 
     monkeypatch.setattr(tts_mod, "_kokoro_synthesize", fake_kokoro)
+    monkeypatch.setattr(tts_mod, "_KOKORO_PIPELINES", {"a": object()})
 
     class FakePiper:
         async def synthesize(self, text):
@@ -128,6 +138,38 @@ def test_hud_speaker_english_kokoro_first(monkeypatch):
 
     sp = tts_mod.HudSpeaker(piper=FakePiper())
     assert asyncio.run(sp.synthesize("hello", "en")) == b"KOKORO"
+
+
+def test_hud_speaker_piper_covers_cold_kokoro(monkeypatch):
+    """Cold Kokoro must not stall sentence one: Piper answers instead."""
+    from hud import tts as tts_mod
+
+    async def boom_kokoro(text, lang="en-us"):
+        raise AssertionError("cold Kokoro must not even be attempted")
+
+    monkeypatch.setattr(tts_mod, "_kokoro_synthesize", boom_kokoro)
+    monkeypatch.setattr(tts_mod, "_KOKORO_PIPELINES", {})
+
+    class FakePiper:
+        async def synthesize(self, text):
+            return b"PIPER"
+
+    sp = tts_mod.HudSpeaker(piper=FakePiper())
+    assert asyncio.run(sp.synthesize("hello", "en")) == b"PIPER"
+
+
+def test_warmup_kokoro_reports_readiness(monkeypatch):
+    from hud import tts as tts_mod
+
+    monkeypatch.setattr(tts_mod, "_KOKORO_PIPELINES", {})
+
+    async def fake_build(text, lang="en-us"):
+        tts_mod._KOKORO_PIPELINES["a"] = object()
+        return b"WAV"
+
+    monkeypatch.setattr(tts_mod, "_kokoro_synthesize", fake_build)
+    assert asyncio.run(tts_mod.warmup_kokoro()) is True
+    assert tts_mod.kokoro_ready() is True
 
 
 def test_kokoro_pipeline_cached(monkeypatch):
@@ -140,8 +182,8 @@ def test_kokoro_pipeline_cached(monkeypatch):
     builds = []
 
     class FakePipeline:
-        def __init__(self, lang_code="a"):
-            builds.append(lang_code)
+        def __init__(self, lang_code="a", device=None):
+            builds.append((lang_code, device))
 
         def __call__(self, text, voice="af_heart", speed=1.0):
             import numpy as np
@@ -162,7 +204,7 @@ def test_kokoro_pipeline_cached(monkeypatch):
 
     assert asyncio.run(tts_mod._kokoro_synthesize("one", "en")) == b"WAV"
     assert asyncio.run(tts_mod._kokoro_synthesize("two", "en")) == b"WAV"
-    assert builds == ["a"]  # built once, reused
+    assert builds == [("a", "cpu")]  # built once (CPU-pinned), reused
 
 
 def test_hud_speaker_tamil_edge_and_fallback(monkeypatch):
@@ -233,8 +275,9 @@ def _qapp():
     return _APP
 
 
-def test_collect_while_recording_joins_on_stop(monkeypatch):
-    """Pauses must not split a push-to-talk query: endpointed chunks join."""
+def test_endpoint_auto_responds_while_recording(monkeypatch):
+    """Hands-free: each endpointed utterance starts a turn immediately —
+    no toggle-off needed. Busy turns queue via _start_turn."""
     _qapp()
     import hud.stt as stt_mod
     import hud.window as window_mod
@@ -258,57 +301,36 @@ def test_collect_while_recording_joins_on_stop(monkeypatch):
     win = MainWindow()
     try:
         win._begin_turn = lambda text, lang: begun.append((text, lang))
-        win.mic.recording = True  # simulate toggle held on
-        c1, c2 = _tone_pcm(), _tone_pcm()
+        win.mic.recording = True  # toggle held on: still answers per pause
+        c1 = _tone_pcm()
         win._on_mic_utterance(c1)
-        win._on_mic_utterance(c2)
-        assert sum(len(c) for c in win._pending_pcm) == len(c1) + len(c2)
-        assert begun == []  # nothing started mid-recording
-        win.mic.recording = False  # toggle off → flush path joins all
-        c3 = _tone_pcm()
-        win._on_mic_utterance(c3)
-        assert len(begun) == 1
-        assert begun[0] == ("hello world", "en")
+        assert begun == [("hello world", "en")]
         assert win._pending_pcm == []
-        # One whisper call over the joined audio (all three chunks inside).
         assert len(seen_wavs) == 1
-        assert len(seen_wavs[0]) >= len(c1) + len(c2) + len(c3)
+        assert len(seen_wavs[0]) >= len(c1)
     finally:
         win.close()
         win.deleteLater()
 
 
-def test_toggle_off_drains_stranded_pending(monkeypatch):
-    """The exact live failure: endpoints consumed the taker, so the stop
-    flush emits nothing — toggle-off must still process collected audio."""
+def test_toggle_off_with_empty_flush_is_quiet(monkeypatch):
+    """Toggle-off with an empty taker flush must not crash or double-fire."""
     _qapp()
-    import hud.stt as stt_mod
     import hud.window as window_mod
     from hud.window import MainWindow
 
-    async def fake_transcribe(wav, filename="hud.wav"):
-        return ("hello world", "en")
-
-    monkeypatch.setattr(stt_mod, "transcribe_with_lang", fake_transcribe)
-    monkeypatch.setattr("voice_server.vad.has_speech", lambda pcm: True)
     monkeypatch.setattr(
         window_mod, "_run_in_thread",
-        lambda host, fn, on_done, on_failed=None: on_done(fn()),
+        lambda host, fn, on_done, on_failed=None: None,
     )
 
     win = MainWindow()
     try:
         begun = []
         win._begin_turn = lambda text, lang: begun.append((text, lang))
-        win.mic.recording = True
-        win._on_mic_utterance(_tone_pcm())
-        win._on_mic_utterance(_tone_pcm())
-        assert begun == []
-        # Real MicWorker.stop() with no audio emits nothing (empty flush).
         win.mic.recording = False
-        win._on_mic_toggled(False)
-        assert len(begun) == 1
-        assert begun[0] == ("hello world", "en")
+        win._on_mic_toggled(False)  # real MicWorker.stop: empty flush, no-op
+        assert begun == []
         assert win._pending_pcm == []
     finally:
         win.close()
@@ -580,7 +602,34 @@ def test_self_test_quiet_mic_hint(monkeypatch):
         win.deleteLater()
 
 
-def test_window_smoke_offscreen():
+def test_run_in_thread_delivers():
+    """Real QThread delivery (regression: an unparented worker was GC'd
+    before started fired, so fn() silently never ran — no logs, no crash)."""
+    _qapp()
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    import hud.window as window_mod
+    from hud.window import MainWindow
+
+    win = MainWindow()
+    try:
+        got = []
+        # Drop all local refs immediately after spawning, exactly like
+        # production call sites do (this is what exposed the GC bug).
+        window_mod._run_in_thread(win, lambda: 41 + 1, got.append)
+        # Pump GUI events until delivered or timeout.
+        import time as _time
+
+        from PyQt6.QtWidgets import QApplication
+
+        t0 = _time.monotonic()
+        while not got and _time.monotonic() - t0 < 5:
+            QApplication.instance().processEvents()
+            _time.sleep(0.01)
+        assert got == [42]
+    finally:
+        win.close()
+        win.deleteLater()
     _qapp()
     from hud.window import MainWindow
 
@@ -603,6 +652,247 @@ def test_window_smoke_offscreen():
         win._busy = False
         win.text_in.setText("   ")
         win._on_send_text()  # empty: no-op, no crash
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_preload_voice_ml_idempotent():
+    import sys
+
+    from hud.app import preload_voice_ml
+
+    preload_voice_ml()
+    preload_voice_ml()  # second call harmless
+    assert "faster_whisper" in sys.modules
+    assert "faster_whisper.vad" in sys.modules
+
+
+def test_concurrent_voice_imports_no_deadlock():
+    """Regression: concurrent first-imports from worker threads tripped
+    3.14 import-lock deadlock detection; the loser then latched STT off
+    for the whole process (0 chars forever). Post-preload imports safe."""
+    import sys
+    import threading
+
+    from hud.app import preload_voice_ml
+
+    preload_voice_ml()
+    errors: list = []
+
+    def do_import():
+        try:
+            import faster_whisper.vad  # noqa: F401
+            import edge_tts  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=do_import) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not [t for t in threads if t.is_alive()], "import hung"
+    assert errors == []
+    assert "faster_whisper.vad" in sys.modules
+
+
+def test_turn_streams_tokens_into_synth(monkeypatch):
+    """Regression: on_token must feed SentenceSynth or no voice ever plays."""
+    import hud.loop as loop_mod
+    import hud.workers as workers_mod
+
+    async def fake_respond(session_key, text, owner=None, on_token=None,
+                           on_retry=None, ephemeral=False, mode="normal"):
+        for tok in ["Hello there. ", "How are you? "]:
+            await on_token(tok)
+        return "Hello there. How are you?", [], False
+
+    import core
+
+    monkeypatch.setattr(core, "respond", fake_respond)
+
+    calls = []
+
+    class FakeSpeaker:
+        # Same interface as HudSpeaker: (text, lang).
+        async def synthesize(self, text, lang="en"):
+            calls.append((text, lang))
+            return b"WAV:" + text.encode()[:10]
+
+    heard = []
+    worker = workers_mod.TurnWorker(FakeSpeaker(), "hud:test-synth", "normal")
+    # DirectConnection: no Qt event loop runs in tests, so queued cross-thread
+    # delivery would never fire (production GUI loop delivers normally).
+    from PyQt6.QtCore import Qt
+
+    worker.audio.connect(heard.append, Qt.ConnectionType.DirectConnection)
+    loop_mod.call(worker._go(), timeout=30)
+    assert calls == [("Hello there.", "en"), ("How are you?", "en")]
+    assert len(heard) == 2
+    assert all(h.startswith(b"WAV:") for h in heard)
+
+
+def _fake_transcriber(first, forced=None):
+    """Fake core.speech_transcriber. first=(text,lang,prob);
+    forced maps language -> (text,lang,prob). Counts transcribe calls."""
+    import asyncio
+    from types import SimpleNamespace
+
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, tmp, **kwargs):
+            calls.append(kwargs.get("language"))
+            if kwargs.get("language") and forced and kwargs["language"] in forced:
+                text, lang, prob = forced[kwargs["language"]]
+            else:
+                text, lang, prob = first
+            segs = [SimpleNamespace(text=text)]
+            info = SimpleNamespace(language=lang, language_probability=prob)
+            return segs, info
+
+    tr = SimpleNamespace(
+        enabled=True, _model=FakeModel(), _transcribe_lock=asyncio.Lock()
+    )
+    return tr, calls
+
+
+def test_stt_accepts_clean_ta_en(monkeypatch):
+    import asyncio
+
+    import core
+    from hud import stt as stt_mod
+
+    tr, calls = _fake_transcriber(("vanakkam", "ta", 0.92))
+    monkeypatch.setattr(core, "speech_transcriber", tr)
+    monkeypatch.setattr(core, "transcribe_audio", None, raising=False)
+    text, lang = asyncio.run(stt_mod.transcribe_with_lang(b"\x01\x02" * 500))
+    assert (text, lang) == ("vanakkam", "ta")
+    assert calls == [None]  # single pass, no runoff
+
+
+def test_stt_runoff_picks_ta_over_ml(monkeypatch):
+    """Tamil heard as Malayalam (live case: ml 0.66) must resolve to ta."""
+    import asyncio
+
+    import core
+    from hud import stt as stt_mod
+
+    tr, calls = _fake_transcriber(
+        ("malayalam garbage", "ml", 0.66),
+        forced={"ta": ("vanakkam nanba", "ta", 0.81),
+                "en": ("hello friend", "en", 0.22)},
+    )
+    monkeypatch.setattr(core, "speech_transcriber", tr)
+    text, lang = asyncio.run(stt_mod.transcribe_with_lang(b"\x01\x02" * 500))
+    assert lang == "ta"
+    assert text == "vanakkam nanba"
+    assert calls == [None, "ta", "en"]
+
+
+def test_stt_runoff_picks_en(monkeypatch):
+    import asyncio
+
+    import core
+    from hud import stt as stt_mod
+
+    tr, calls = _fake_transcriber(
+        ("bengali garbage", "bn", 0.39),
+        forced={"ta": ("tamil garbage", "ta", 0.31),
+                "en": ("what time is it", "en", 0.74)},
+    )
+    monkeypatch.setattr(core, "speech_transcriber", tr)
+    text, lang = asyncio.run(stt_mod.transcribe_with_lang(b"\x01\x02" * 500))
+    assert lang == "en"
+    assert text == "what time is it"
+
+
+def test_theme_has_tamil_font_fallback():
+    import hud.theme as theme_mod
+
+    css = theme_mod.build_stylesheet()
+    assert "Nirmala UI" in css
+
+
+def test_no_cpp_comments_in_hud():
+    """Guard: `//` is not a Python comment — stray ones are SyntaxError
+    risks (or dead text) that editors don't flag."""
+    import pathlib
+    import re
+
+    bad = []
+    for path in (pathlib.Path(__file__).resolve().parent.parent / "hud").glob("*.py"):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.match(r"\s*//", line):
+                bad.append(f"{path.name}:{i}")
+    assert bad == []
+
+
+def test_chat_markdown_keeps_line_breaks_outside_pre():
+    from hud.markdown import render_chat_html
+
+    out = render_chat_html("Top picks of 2026:\n1. First film\n2. Second film")
+    assert "20261." not in out  # the reported collapse
+    assert "<br" in out
+    assert "First film" in out and "Second film" in out
+
+
+def test_chat_markdown_preserves_pre_blocks():
+    from hud.markdown import render_chat_html
+
+    out = render_chat_html("```py\nline1\nline2\n```")
+    assert "<pre" in out
+    # newlines inside <pre> stay literal for QTextEdit's monospace block
+    inner = out.split("<pre", 1)[1]
+    assert "\n" in inner
+
+
+def test_say_bubbles_and_markdown():
+    _qapp()
+    from hud.window import MainWindow
+
+    win = MainWindow()
+    try:
+        win._say("You", "hello there")
+        html = win.transcript.toHtml()
+        assert 'align="right"' in html
+        assert "hello there" in win.transcript.toPlainText()
+        win._say("Jarvis", "**bold** answer with `code`")
+        html = win.transcript.toHtml()
+        assert "#0d1b26" in html  # jarvis bubble (user bubble is #12324a)
+        assert "bold" in win.transcript.toPlainText()
+        # raw markdown syntax must not leak through rendered output
+        assert "**bold**" not in html
+        # single newlines (softbreaks) must break lines in Qt, not collapse
+        win._say("Jarvis", "Top picks of 2026:\n1. First film\n2. Second film")
+        html = win.transcript.toHtml().replace("<br />", "<br/>")
+        assert "Top picks of 2026:<br/><br/>1. First film<br/>2. Second film" in html
+        plain = win.transcript.toPlainText()
+        assert "First film" in plain and "Second film" in plain
+        win._say("Jarvis", "_ephemeral notice_")
+        assert "ephemeral notice" in win.transcript.toPlainText()
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_audio_queue_and_media_status():
+    _qapp()
+    from hud.window import MainWindow
+
+    win = MainWindow()
+    try:
+        win._busy = True  # stay busy so EndOfMedia doesn't flip state
+        win._on_turn_audio(b"\x01\x02" * 100)
+        # Either queued or already consumed by offscreen playback; both fine.
+        from PyQt6.QtMultimedia import QMediaPlayer
+
+        win._on_media_status(QMediaPlayer.MediaStatus.EndOfMedia)
+        win._busy = False
+        win._audio_queue.clear()
+        win._on_media_status(QMediaPlayer.MediaStatus.EndOfMedia)
+        assert win.status.text().startswith("idle")
     finally:
         win.close()
         win.deleteLater()

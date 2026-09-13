@@ -8,11 +8,28 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+def preload_voice_ml() -> None:
+    """Import voice ML modules once, on the main thread, before any worker.
+
+    CPython's import lock + 3.14 deadlock detection make concurrent
+    first-imports from threads fatal: the loser raises, and
+    SpeechTranscriber._disable() then latches transcription OFF for the
+    whole process (0 chars forever). Eager import removes the race.
+    """
+    for name in ("numpy", "faster_whisper", "faster_whisper.vad", "edge_tts"):
+        try:
+            __import__(name)
+        except Exception:
+            logger.debug("voice ML preload skipped %s", name, exc_info=True)
+    logger.info("voice ML imports ready")
+
+
 def main() -> int:
     import core
     from paths import memory_db
     from paths import documents_dir
 
+    preload_voice_ml()
     core.load_histories()
     core.init_memory(memory_db())
     core.init_docs(memory_db())
@@ -42,8 +59,8 @@ def main() -> int:
     win.show()
 
     def _warmup_voice():
-        # Pay torch/whisper/Silero first-load cost upfront in the background
-        # so the first real turn isn't the slow (or frozen-feeling) one.
+        # Pay torch/whisper/Silero/Kokoro first-load cost upfront in the
+        # background so the first real turn isn't slow (or frozen-feeling).
         # NOTE: uses submit() (non-blocking) to avoid holding _transcribe_lock
         # across the daemon thread boundary, which was causing the voice pipeline
         # to appear frozen: the STT QThread would block waiting for the lock
@@ -54,11 +71,15 @@ def main() -> int:
             from voice_server.stt import warmup as stt_warmup
             from voice_server.vad import has_speech
             from .loop import submit
+            from .tts import warmup_kokoro
 
             logger.info("HUD voice warmup starting")
             future = submit(stt_warmup())
             future.result(timeout=300)  # wait but in the daemon thread, not GUI
             has_speech(b"\x00" * 32000)  # load Silero once
+            logger.info("HUD STT/Silero warm")
+            kokoro_future = submit(warmup_kokoro())
+            kokoro_future.result(timeout=600)
             logger.info("HUD voice warmup done")
         except Exception:
             logger.exception("HUD voice warmup failed (non-fatal)")

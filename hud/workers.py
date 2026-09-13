@@ -184,12 +184,16 @@ class TurnWorker(QObject):
                 pass
 
     async def _go(self) -> None:
+        import time as _time
+
         import core
 
         from voice_server.tts import SentenceSynth
 
         from .router import decide, needs_multilingual_model, suggest_tamil_model
 
+        t0 = _time.perf_counter()
+        logger.info("HUD turn start (lang=%s, mode=%s)", self._lang, self._mode)
         route = decide(self._lang)
         self.state.emit("thinking")
         if needs_multilingual_model(self._lang, core.MODEL_NAME):
@@ -202,18 +206,27 @@ class TurnWorker(QObject):
                     self.notice.emit(f"Model switch failed ({e}); continuing.")
         synth = SentenceSynth(_LangSpeaker(self._speaker, route["lang"]), self._on_sentence)
         streamed: list[str] = []
+        first_token_at: list[float] = []
 
         async def on_token(token: str):
+            if not first_token_at:
+                first_token_at.append(_time.perf_counter())
+                logger.info("HUD first token after %.1fs", first_token_at[0] - t0)
             streamed.append(token)
             self.token.emit(token)
+            await synth.feed_token(token)
 
         try:
-            body, _sources, _failed = await core.respond(
+            body, _sources, failed = await core.respond(
                 self._chat_key,
                 self._transcript,
                 owner="hud",
                 on_token=on_token,
                 mode=self._mode,
+            )
+            logger.info(
+                "HUD respond done in %.1fs (failed=%s, streamed=%d chars)",
+                _time.perf_counter() - t0, failed, len("".join(streamed)),
             )
         except Exception:
             logger.exception("HUD turn failed")
@@ -222,6 +235,7 @@ class TurnWorker(QObject):
         finally:
             await synth.drain()
         full = "".join(streamed).strip() or body
+        logger.info("HUD turn finished in %.1fs", _time.perf_counter() - t0)
         self.reply.emit(full)
         self.finished.emit()
 

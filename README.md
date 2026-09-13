@@ -197,7 +197,7 @@ A native PyQt6 window unifying chatbot + voice with an animated persona orb:
 run.ps1 hud   # or: python -m hud.app
 ```
 
-Text and push-to-talk voice share one transcript (pauses join a single turn; queued while busy); the animated orb shows idle/listening/endpointing/thinking/speaking with rings, particles and a live waveform. Speech is auto language-detected: Tamil turns speak via cloud EdgeTTS (`ta-IN-ValluvarNeural`, needs internet, Piper fallback otherwise) and suggest a multilingual model (Qwen) when the active one isn't. English stays fully offline (Piper). HUD chat learns like normal chat under its own `hud:*` session; model/mode combos mirror the web gear panel. Two-pane layout with CPU/MEM/GPU/NET telemetry, live accent slider, and an opt-in camera preview (default off). Tamil/English ear-test samples: `.spike-out/` (local only, gitignored).
+Text and push-to-talk voice share one transcript (hands-free: each ~1s pause auto-answers while the mic is on; turns queue while busy); the animated orb shows idle/listening/endpointing/thinking/speaking with rings, particles and a live waveform. Speech is auto language-detected: Tamil turns speak via cloud EdgeTTS (`ta-IN-ValluvarNeural`, needs internet, Piper fallback otherwise) and suggest a multilingual model (Qwen) when the active one isn't. English stays fully offline (Piper). HUD chat learns like normal chat under its own `hud:*` session; model/mode combos mirror the web gear panel. Two-pane layout with CPU/MEM/GPU/NET telemetry, live accent slider, and an opt-in camera preview (default off). Tamil/English ear-test samples: `.spike-out/` (local only, gitignored).
 
 ## 📡 Watching logs live
 

@@ -41,11 +41,11 @@ def set_accent_hue(hue: int) -> str:
 
 def build_stylesheet() -> str:
     return f"""
-    QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; font-family: 'Segoe UI', 'Inter', sans-serif; }}
+    QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; font-family: 'Segoe UI', 'Nirmala UI', 'Inter', sans-serif; }}
     QTextEdit {{
         background: {PANEL}; color: {TEXT};
         border: 1px solid {BORDER}; border-radius: 6px; padding: 6px;
-        font-family: 'Consolas', 'Courier New', monospace; font-size: 11px;
+        font-family: 'Consolas', 'Courier New', 'Nirmala UI', monospace; font-size: 11px;
         selection-background-color: {ACCENT_DIM};
     }}
     QLineEdit {{

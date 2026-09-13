@@ -1,8 +1,10 @@
-"""HUD speech-to-text: shared faster-whisper model, auto language detect.
+"""HUD speech-to-text: Tamil and English only, auto-picked per utterance.
 
 Unlike the :8600 console (pinned ``language="en"``), the HUD lets whisper
-choose — this is what makes Tamil input work. Returns (text, lang) where
-lang is a BCP-47-ish code like "en"/"ta" ("" when nothing transcribed).
+choose — but short clips confuse acoustic LID (Tamil heard as Malayalam,
+Bengali, …). So: first pass auto-detects; anything outside {ta, en} (or
+low confidence) gets a forced ta-vs-en second opinion and the winner is
+kept. Returns (text, lang) with lang in {"ta", "en", ""}.
 Fail-soft: never disables the shared transcriber, just reports empties.
 
 CUDA DLL setup is performed at import time so faster-whisper finds the
@@ -86,8 +88,33 @@ _setup_cuda_dll_paths()
 # Transcription
 # ---------------------------------------------------------------------------
 
+#: Languages the HUD supports. Anything else falls back to a ta-vs-en
+#: second opinion (short clips confuse acoustic language ID).
+SUPPORTED_LANGS = ("ta", "en")
+#: Accept first-pass LID at/above this probability.
+LID_CONFIDENCE = 0.5
+
+
+def _decode(model, tmp: str, language: str | None) -> tuple[str, str, float]:
+    """One whisper pass. Returns (text, lang, language_probability)."""
+    kwargs: dict = dict(
+        beam_size=1,
+        condition_on_previous_text=False,
+        temperature=0.0,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 300},
+    )
+    if language:
+        kwargs["language"] = language
+    segments, info = model.transcribe(tmp, **kwargs)
+    text = " ".join(s.text.strip() for s in segments).strip()
+    lang = str(getattr(info, "language", "") or "")
+    prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+    return text, lang, prob
+
+
 async def transcribe_with_lang(data: bytes, filename: str = "hud.wav") -> tuple[str, str]:
-    """Transcribe WAV bytes, auto-detecting language. Returns (text, lang)."""
+    """Transcribe WAV bytes. Returns (text, lang) with lang in ta/en/""."""
     import core
 
     tr = core.speech_transcriber
@@ -114,17 +141,25 @@ async def transcribe_with_lang(data: bytes, filename: str = "hud.wav") -> tuple[
         def _run():
             logger.info("HUD STT: faster-whisper transcribing %d bytes…", len(data))
             try:
-                segments, info = tr._model.transcribe(
-                    tmp,
-                    beam_size=1,
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 300},
+                text, lang, prob = _decode(tr._model, tmp, None)
+                logger.info(
+                    "HUD STT: first pass — %d chars, lang=%s (p=%.2f)",
+                    len(text), lang or "?", prob,
                 )
-                text = " ".join(s.text.strip() for s in segments).strip()
-                lang = str(getattr(info, "language", "") or "")
-                result.append((text, lang))
+                if (lang not in SUPPORTED_LANGS or prob < LID_CONFIDENCE) and text:
+                    # Short-clip LID noise (e.g. Tamil heard as Malayalam):
+                    # forced ta-vs-en runoff, higher confidence wins.
+                    ta_text, _, ta_prob = _decode(tr._model, tmp, "ta")
+                    en_text, _, en_prob = _decode(tr._model, tmp, "en")
+                    logger.info(
+                        "HUD STT: runoff ta(p=%.2f,%dch) vs en(p=%.2f,%dch)",
+                        ta_prob, len(ta_text), en_prob, len(en_text),
+                    )
+                    if (ta_prob, len(ta_text)) >= (en_prob, len(en_text)):
+                        text, lang = ta_text, "ta"
+                    else:
+                        text, lang = en_text, "en"
+                result.append((text, lang if lang in SUPPORTED_LANGS else ""))
                 logger.info(
                     "HUD STT: faster-whisper done — %d chars, lang=%s",
                     len(text), lang or "?"
@@ -150,4 +185,4 @@ async def transcribe_with_lang(data: bytes, filename: str = "hud.wav") -> tuple[
             pass
 
 
-__all__ = ["transcribe_with_lang"]
+__all__ = ["transcribe_with_lang", "SUPPORTED_LANGS", "LID_CONFIDENCE"]

@@ -37,7 +37,11 @@ class SpeechTranscriber:
 
         attempts = []
         if self.device == "auto":
-            attempts.append(("cuda", "float16"))
+            # Honor WHISPER_COMPUTE_TYPE on CUDA too (measured: int8_float16
+            # loads/transcribes faster than float16 on RTX 3050, same output).
+            # CPU fallback stays int8 — float types are too slow there.
+            cuda_compute = os.environ.get("WHISPER_COMPUTE_TYPE", "").strip() or "int8_float16"
+            attempts.append(("cuda", cuda_compute))
             attempts.append(("cpu", "int8"))
         else:
             attempts.append((self.device, self.compute_type))

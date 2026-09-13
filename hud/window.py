@@ -240,6 +240,10 @@ def _run_in_thread(host: QWidget, fn, on_done, on_failed=None) -> QThread:
     """Run fn() in a throwaway QThread owned by host. Returns the thread."""
     thread = QThread(host)
     worker = _FnWorker(fn)
+    # Keep a Python reference for the thread lifetime: without a parent,
+    # the local worker would be garbage-collected (possibly before
+    # started fires) and fn() would silently never run.
+    thread._worker = worker
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.done.connect(on_done)
@@ -390,6 +394,7 @@ class MainWindow(QMainWindow):
         self._audio_out = QAudioOutput(self)
         self.player.setAudioOutput(self._audio_out)
         self.player.mediaStatusChanged.connect(self._on_media_status)
+        self.player.playbackStateChanged.connect(self._on_playback_state)
         self.player.errorOccurred.connect(self._on_player_error)
 
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
@@ -415,7 +420,37 @@ class MainWindow(QMainWindow):
         self.status.setText(f"{state} · {self._mode} · {self.model_combo.currentText()}")
 
     def _say(self, who: str, text: str) -> None:
-        self.transcript.append(f"<b>{who}:</b> {text}")
+        import html as _html
+
+        import hud.theme as theme
+
+        body = text or ""
+        # System notices (italic convention or emoji-led) stay a gray line.
+        if (body.startswith("_") and body.endswith("_") and len(body) > 1) or body[:1] in "⚠️🔇🎤⏳✅🔄⏹🎙🔈":
+            shown = body[1:-1] if (body.startswith("_") and body.endswith("_") and len(body) > 1) else body
+            self.transcript.append(f"<i><font color=\"#8a93a6\">{_html.escape(shown)}</font></i>")
+            return
+        try:
+            from .markdown import render_chat_html
+
+            body_html = render_chat_html(body) or _html.escape(body)
+        except Exception:
+            body_html = _html.escape(body).replace("\n", "<br/>")
+        if who == "You":
+            bubble = (
+                '<table width="100%" cellpadding="0" cellspacing="4"><tr>'
+                '<td align="right"><table cellpadding="8" cellspacing="0"><tr>'
+                f'<td bgcolor="#12324a"><font color="#8fc7ff"><b>You</b></font><br/>{body_html}</td>'
+                "</tr></table></td></tr></table>"
+            )
+        else:
+            bubble = (
+                '<table width="100%" cellpadding="0" cellspacing="4"><tr>'
+                '<td align="left"><table cellpadding="8" cellspacing="0"><tr>'
+                f'<td bgcolor="#0d1b26"><font color="{theme.ACCENT}"><b>Jarvis</b></font><br/>{body_html}</td>'
+                "</tr></table></td></tr></table>"
+            )
+        self.transcript.append(bubble)
 
     def refresh_models(self, names: list[str]) -> None:
         import core
@@ -495,13 +530,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ turn flow
 
     def _on_mic_utterance(self, pcm: bytes) -> None:
-        # Push-to-talk-collect: while the toggle is on, pauses must NOT split
-        # the query — accumulate everything, process once on toggle-off.
+        # Hands-free: every endpointed utterance is answered on its own —
+        # a ~1s pause means "I'm done", no toggle-off needed. Turns that
+        # arrive while busy queue up instead of being dropped.
         self._pending_pcm.append(bytes(pcm))
-        if self.mic.recording:
-            secs = sum(len(c) for c in self._pending_pcm) / 32000.0
-            self.status.setText(f"collecting… {secs:.1f}s (pauses won't split)")
-            return
         self._finish_collected()
 
     def _finish_collected(self) -> None:
@@ -748,6 +780,7 @@ class MainWindow(QMainWindow):
     def _on_turn_audio(self, data: bytes) -> None:
         if data:
             self._audio_queue.append(bytes(data))
+            logger.info("HUD audio queued (%d bytes, depth %d)", len(data), len(self._audio_queue))
             if not self._playing():
                 self._play_next()
 
@@ -761,13 +794,24 @@ class MainWindow(QMainWindow):
         from PyQt6.QtMultimedia import QMediaPlayer
 
         self.player.setSourceDevice(self._audio_buf)
+        logger.info("HUD playing %d bytes (queue left %d)", len(chunk), len(self._audio_queue))
         self.player.play()
         self._set_state("speaking")
+
+    def _on_playback_state(self, state) -> None:
+        from PyQt6.QtMultimedia import QMediaPlayer
+
+        logger.info("HUD playback state: %s", state)
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._set_state("speaking")
+            self.orb.persona.set_level(0.6)
 
     def _on_media_status(self, status) -> None:
         from PyQt6.QtMultimedia import QMediaPlayer
 
+        logger.debug("HUD media status: %s", status)
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            logger.info("HUD sentence finished (queue left %d)", len(self._audio_queue))
             if self._audio_queue:
                 self._play_next()
             elif not self._busy:
