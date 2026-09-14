@@ -134,8 +134,10 @@ async def _kokoro_synthesize(text: str, lang: str = "en-us") -> bytes | None:
             logger.info("HUD Kokoro: pipeline ready")
 
         def _run():
+            import os
+            voice = os.environ.get("HUD_KOKORO_VOICE", "am_michael").strip() or "am_michael"
             audio_parts = []
-            for _, _, audio in pipeline(text, voice="af_heart", speed=1.0):
+            for _, _, audio in pipeline(text, voice=voice, speed=1.0):
                 if audio is not None:
                     try:
                         arr = audio.detach().cpu().numpy()
