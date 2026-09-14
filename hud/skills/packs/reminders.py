@@ -8,7 +8,9 @@ spoken correction, never silently scheduled.
 
 from __future__ import annotations
 
+import base64
 import csv
+import ctypes
 import io
 import logging
 import os
@@ -76,6 +78,61 @@ def _slug(message: str, when: datetime) -> str:
 
 
 # ------------------------------------------------------------- schtasks
+
+
+def _system_short_date_pattern() -> str:
+    """Return Windows' short-date pattern for the current user, e.g.
+    'dd-MM-yyyy' (en-IN) or 'M/d/yyyy' (en-US).
+
+    ``schtasks /sd`` parses the date using exactly this pattern, so we must
+    format the date to match it. Hardcoding MM/dd/yyyy breaks on any system
+    whose locale orders the date differently (produces 'Incorrect Start
+    Date')."""
+    if os.name != "nt":
+        return "dd-MM-yyyy"
+    buf = ctypes.create_unicode_buffer(80)
+    n = 0
+    try:
+        n = ctypes.windll.kernel32.GetLocaleInfoEx(None, 0x1F, buf, len(buf))
+    except Exception:
+        pass
+    if n <= 0:
+        try:
+            n = ctypes.windll.kernel32.GetLocaleInfoW(0x0400, 0x1F, buf, len(buf))
+        except Exception:
+            pass
+    return buf.value if n > 0 else "dd-MM-yyyy"
+
+
+def _schtasks_date(dt: datetime) -> str:
+    """Format ``dt`` for ``schtasks /sd`` using the system short-date pattern."""
+    pat = _system_short_date_pattern()
+    out = pat
+    out = out.replace("yyyy", dt.strftime("%Y"))
+    out = out.replace("yy", dt.strftime("%y"))
+    out = out.replace("MMMM", dt.strftime("%B"))
+    out = out.replace("MMM", dt.strftime("%b"))
+    out = out.replace("MM", dt.strftime("%m"))
+    out = out.replace("M", dt.strftime("%m").lstrip("0"))
+    out = out.replace("dd", dt.strftime("%d"))
+    out = out.replace("d", dt.strftime("%d").lstrip("0"))
+    return out
+
+
+def _popup_command(message: str, task_name: str = "reminder") -> str:
+    """Write a temp VBScript and return the ``wscript`` command for schtasks.
+
+    VBScript MsgBox works on all Windows editions.  ``msg.exe`` only ships
+    with Pro/Enterprise (fails with 0x80070002 on Home), and the PowerShell
+    ``-EncodedCommand`` approach exceeds schtasks' 261-char ``/tr`` limit.
+    """
+    import tempfile
+
+    safe_msg = message.replace('"', '""')
+    vbs_path = os.path.join(tempfile.gettempdir(), f"{task_name}.vbs")
+    with open(vbs_path, "w", encoding="ascii", newline="\r\n") as f:
+        f.write(f'MsgBox "{safe_msg}", 48, "Jarvis Reminder"\r\n')
+    return f'wscript "{vbs_path}"'
 
 
 def _run_schtasks(args: list[str]) -> tuple[bool, str]:
@@ -237,13 +294,13 @@ def remind_me(action: str = "add", message: str = "", when: str = "", target: st
             f"Try 'in 20 minutes', 'tomorrow 9am' or '2026-09-14 14:30'."
         )
     name = _slug(msg, moment)
-    popup = 'msg * "' + msg.replace('"', "'")[:200] + '"'
+    popup = _popup_command(msg[:200], task_name=name)
     ok, out = _run_schtasks([
         "/create", "/tn", name,
         "/tr", popup,
         "/sc", "once",
         "/st", moment.strftime("%H:%M"),
-        "/sd", moment.strftime("%m/%d/%Y"),
+        "/sd", _schtasks_date(moment),
         "/f",
     ])
     if ok:
