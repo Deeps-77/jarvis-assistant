@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 TAMIL_VOICE = "ta-IN-ValluvarNeural"
 # Measured Sep 2026 on this machine (Tamil math/poem/tool probes):
-# gemma-4-E2B-it > qwen3.5:2b on fluency and correctness, so gemma first.
-TAMIL_MODEL_HINTS = ("gemma", "qwen")
+# qwen3:1.7b is the smallest model with proven Tamil comprehension (119 languages).
+TAMIL_MODEL_HINTS = ("qwen3:1.7b", "qwen", "gemma")
 
 
 def decide(lang: str, current_model: str = "") -> dict:
