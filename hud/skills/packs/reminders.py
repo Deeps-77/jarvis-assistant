@@ -12,6 +12,7 @@ import base64
 import csv
 import ctypes
 import io
+import json
 import logging
 import os
 import re
@@ -150,6 +151,29 @@ def _run_schtasks(args: list[str]) -> tuple[bool, str]:
         return False, str(e)
     out = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode == 0, out.strip()[:500]
+
+
+def _write_notification(message: str, when: datetime) -> None:
+    """Append a pending notification for the HUD toast watcher."""
+    try:
+        from paths import data_path
+        notif_path = data_path("pending_notifications.json")
+        entries = []
+        if notif_path.exists():
+            try:
+                entries = json.loads(notif_path.read_text(encoding="utf-8"))
+            except Exception:
+                entries = []
+        entries.append({
+            "title": "Jarvis Reminder",
+            "message": message,
+            "ts": time.time(),
+        })
+        tmp = notif_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        tmp.replace(notif_path)
+    except Exception:
+        logger.debug("Failed to write notification file", exc_info=True)
 
 
 def _list_tasks() -> list[dict]:
@@ -305,7 +329,8 @@ def remind_me(action: str = "add", message: str = "", when: str = "", target: st
     ])
     if ok:
         logger.info("reminder scheduled %s", name)
-        return f"Reminder set: {msg} @ {moment.strftime('%A %d %B, %I:%M %p')}."
+        _write_notification(msg, moment)
+        return f"Reminder set: {msg} @ {moment.strftime('%A %d %B, %I:%M %p')}." 
     return f"ERROR: couldn't schedule ({out})."
 
 

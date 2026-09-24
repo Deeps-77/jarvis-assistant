@@ -7,6 +7,7 @@ no model loads) so offscreen unit tests can instantiate it.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from PyQt6.QtCore import (
@@ -14,6 +15,7 @@ from PyQt6.QtCore import (
     QByteArray,
     QPointF,
     QRectF,
+    QSettings,
     Qt,
     QThread,
     QTimer,
@@ -320,10 +322,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Jarvis")
-        self.resize(900, 700)
         self._chat_key = "hud:main"
         self._mode = "normal"
         self._busy = False
+        self._current_worker = None  # for barge-in cancellation
         self._pending_pcm: list[bytes] = []  # mic audio collected while toggle is on
         self._pending_turns: list[tuple[str, str]] = []  # (text, lang) queued while busy
         self._live_text = ""  # streamed reply tokens for the live line
@@ -474,6 +476,28 @@ class MainWindow(QMainWindow):
         set_provider("screen_grabber", self._grabber.grab)
         set_provider("on_goodbye", self._request_goodbye)
 
+        # Restore window geometry from last session.
+        qs = QSettings("Jarvis", "HUD")
+        if qs.contains("geometry"):
+            self.restoreGeometry(qs.value("geometry"))
+            self.restoreState(qs.value("state"))
+        else:
+            self.resize(900, 700)
+
+        # Load persisted settings (accent, VAD, model, mode).
+        self._load_settings()
+
+        # Auto-save settings when any relevant control changes.
+        self.accent_slider.valueChanged.connect(lambda _: self._save_settings())
+        self.vad_slider.valueChanged.connect(lambda _: self._save_settings())
+        self.model_combo.currentTextChanged.connect(lambda _: self._save_settings())
+        self.mode_combo.currentTextChanged.connect(lambda _: self._save_settings())
+
+        # Notification watcher for toast alerts (reminders, etc.).
+        from .notifications import NotificationWatcher
+        self._notif_watcher = NotificationWatcher(self)
+        self._notif_watcher.notification.connect(self._show_toast)
+
         self._set_state("idle")
 
     def _on_skills_toggled(self, on: bool) -> None:
@@ -509,23 +533,6 @@ class MainWindow(QMainWindow):
 
         threading.Timer(12.0, _quit).start()
 
-    def _request_goodbye(self) -> None:
-        import threading
-
-        from PyQt6.QtWidgets import QApplication
-
-        self._say("Jarvis", "_Closing in a few seconds — goodbye!_")
-
-        def _quit():
-            app = QApplication.instance()
-            if app is not None:
-                try:
-                    app.quit()
-                except Exception:
-                    pass
-
-        threading.Timer(12.0, _quit).start()
-
     # ------------------------------------------------------------ UI state
 
     def _on_shortcut_space(self) -> None:
@@ -533,12 +540,101 @@ class MainWindow(QMainWindow):
             self.mic_btn.toggle()
             
     def _on_shortcut_esc(self) -> None:
+        """Barge-in: stop mic, cancel active turn, stop playback."""
         if self.mic.recording:
             self.mic_btn.setChecked(False)
+        if self._busy and self._current_worker is not None:
+            self._current_worker.cancel()
+            self._current_worker = None
+        self.player.stop()
+        self._audio_queue.clear()
+        if self._busy:
+            self._busy = False
+            self._set_state("idle")
+            self._say("Jarvis", "_Stopped._")
 
     def _set_state(self, state: str) -> None:
         self.orb.persona.set_state(state)
         self.status.setText(f"{state} · {self._mode} · {self.model_combo.currentText()}")
+
+    def _scroll_transcript(self) -> None:
+        """Scroll the transcript to the bottom after a new message."""
+        sb = self.transcript.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _show_toast(self, title: str, message: str) -> None:
+        """Display a non-modal toast notification in the top-right corner."""
+        from .notifications import ToastWidget
+        toast = ToastWidget(title, message, parent=self)
+        toast.show()
+        # Reposition after show (size known).
+        toast.move(self.width() - toast.width() - 16, 16)
+
+    # ------------------------------------------------------------ settings
+
+    @staticmethod
+    def _settings_path():
+        from paths import data_path
+        return data_path("hud_settings.json")
+
+    def _load_settings(self) -> None:
+        """Restore persisted settings (accent, VAD, model, mode)."""
+        try:
+            raw = self._settings_path().read_text(encoding="utf-8")
+            s = json.loads(raw)
+        except Exception:
+            return
+        # Block signals to avoid triggering mode/model change callbacks during load
+        self.accent_slider.blockSignals(True)
+        self.vad_slider.blockSignals(True)
+        self.mode_combo.blockSignals(True)
+        self.model_combo.blockSignals(True)
+        try:
+            hue = s.get("accent_hue")
+            if isinstance(hue, (int, float)) and 0 <= hue <= 359:
+                self.accent_slider.setValue(int(hue))
+            vad = s.get("vad_threshold")
+            if isinstance(vad, (int, float)) and 100 <= vad <= 3000:
+                self.vad_slider.setValue(int(vad))
+            mode = s.get("mode")
+            if mode in ("normal", "quick", "research", "docs"):
+                self.mode_combo.setCurrentText(mode)
+                self._mode = mode
+            model = s.get("model")
+            if model and isinstance(model, str):
+                self.model_combo.setCurrentText(model)
+        finally:
+            self.accent_slider.blockSignals(False)
+            self.vad_slider.blockSignals(False)
+            self.mode_combo.blockSignals(False)
+            self.model_combo.blockSignals(False)
+        # Apply accent color (slider was blocked, so apply manually)
+        import hud.theme as theme
+        theme.set_accent_hue(self.accent_slider.value())
+
+    def _save_settings(self) -> None:
+        """Persist current settings to disk."""
+        s = {
+            "accent_hue": self.accent_slider.value(),
+            "vad_threshold": self.vad_slider.value(),
+            "model": self.model_combo.currentText(),
+            "mode": self._mode,
+        }
+        try:
+            path = self._settings_path()
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(s, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            logger.debug("Failed to save HUD settings", exc_info=True)
+
+    def closeEvent(self, event) -> None:
+        """Save window geometry and settings on close."""
+        qs = QSettings("Jarvis", "HUD")
+        qs.setValue("geometry", self.saveGeometry())
+        qs.setValue("state", self.saveState())
+        self._save_settings()
+        super().closeEvent(event)
 
     def _say(self, who: str, text: str) -> None:
         import html as _html
@@ -550,6 +646,7 @@ class MainWindow(QMainWindow):
         if (body.startswith("_") and body.endswith("_") and len(body) > 1) or body[:1] in "⚠️🔇🎤⏳✅🔄⏹🎙🔈":
             shown = body[1:-1] if (body.startswith("_") and body.endswith("_") and len(body) > 1) else body
             self.transcript.append(f"<i><font color=\"#8a93a6\">{_html.escape(shown)}</font></i>")
+            self._scroll_transcript()
             return
         try:
             from .markdown import render_chat_html
@@ -572,6 +669,7 @@ class MainWindow(QMainWindow):
                 "</tr></table></td></tr></table>"
             )
         self.transcript.append(bubble)
+        self._scroll_transcript()
 
     def refresh_models(self, names: list[str]) -> None:
         import core
@@ -760,6 +858,7 @@ class MainWindow(QMainWindow):
         worker.reply.connect(self._on_turn_reply)
         worker.state.connect(self._set_state)
         worker.finished.connect(lambda: self._on_turn_done(worker))
+        self._current_worker = worker
         worker.start_turn(text, lang)
 
     def _on_turn_token(self, token: str) -> None:
@@ -774,6 +873,7 @@ class MainWindow(QMainWindow):
 
     def _on_turn_done(self, worker: QObject) -> None:
         self._busy = False
+        self._current_worker = None
         worker.deleteLater()
         if self._pending_turns:
             items = list(self._pending_turns)
